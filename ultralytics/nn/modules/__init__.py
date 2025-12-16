@@ -101,6 +101,7 @@ from .transformer import (
     TransformerEncoderLayer,
     TransformerLayer,
 )
+from .vt import VTImageDomainTap, VTInstanceDomainTap
 
 __all__ = (
     "AIFI",
@@ -179,4 +180,6 @@ __all__ = (
     "YOLOEDetect",
     "YOLOESegment",
     "v10Detect",
+    "VTImageDomainTap",
+    "VTInstanceDomainTap",
 )

@@ -1869,6 +1869,21 @@ class Albumentations:
             }  # from https://albumentations.ai/docs/getting_started/transforms_and_targets/#spatial-level-transforms
 
             # Transforms, use custom transforms if provided, otherwise use defaults
+            def _image_compression_transform(p: float = 0.0):
+                # Albumentations API compatibility:
+                # - newer versions: ImageCompression(quality_range=(low, high))
+                # - older versions: ImageCompression(quality_lower=low, quality_upper=high)
+                try:
+                    import inspect
+
+                    params = inspect.signature(A.ImageCompression).parameters
+                    if "quality_range" in params:
+                        return A.ImageCompression(quality_range=(75, 100), p=p)
+                    return A.ImageCompression(quality_lower=75, quality_upper=100, p=p)
+                except Exception:
+                    # Fall back to a no-op if albumentations internals change unexpectedly.
+                    return A.NoOp(p=p)
+
             T = (
                 [
                     A.Blur(p=0.01),
@@ -1877,7 +1892,7 @@ class Albumentations:
                     A.CLAHE(p=0.01),
                     A.RandomBrightnessContrast(p=0.0),
                     A.RandomGamma(p=0.0),
-                    A.ImageCompression(quality_range=(75, 100), p=0.0),
+                    _image_compression_transform(p=0.0),
                 ]
                 if transforms is None
                 else transforms

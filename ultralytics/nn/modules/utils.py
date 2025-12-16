@@ -8,6 +8,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.init import uniform_
+import numpy as np
+import cv2
+from scipy.fftpack import dct, idct
 
 __all__ = "inverse_sigmoid", "multi_scale_deformable_attn_pytorch"
 
@@ -157,3 +160,126 @@ def multi_scale_deformable_attn_pytorch(
         .view(bs, num_heads * embed_dims, num_queries)
     )
     return output.transpose(1, 2).contiguous()
+
+
+
+
+def dct(x):
+    return dct(dct(x, axis=0, norm="ortho"), axis=1, norm="ortho")
+
+
+def idct(x):
+    return idct(idct(x, axis=0, norm="ortho"), axis=1, norm="ortho")
+
+
+def dct_scg(
+    img_bgr,
+    targets,
+    R_L=0.25,
+    R_H=0.6,
+    bg_strength=(0.35, 0.08, 0.08),   # (Y, U, V)
+    fg_strength=(0.0, 0.0, 0.0),
+    mix_alpha=0.6,
+    freq_gamma=1.0,
+):
+    """
+    Source-only Frequency-domain SCG (Improved)
+
+
+    Args:
+        img_bgr: uint8, BGR, (H, W, 3)   [ONLY SOURCE DOMAIN]
+        targets: N x 5, (cls, cx, cy, w, h), normalized
+        R_L, R_H: ring band-pass ratios
+        bg_strength: per-channel background perturb strength (Y, U, V)
+        fg_strength: per-channel foreground perturb strength (Y, U, V)
+        mix_alpha: blend ratio
+        freq_gamma: frequency weighting exponent
+
+    Returns:
+        out_bgr: uint8
+    """
+
+    H, W = img_bgr.shape[:2]
+
+    # --------------------------------------------------
+    # 1. Foreground / Background mask
+    # --------------------------------------------------
+    fg_mask = np.zeros((H, W), dtype=np.float32)
+
+    for tgt in targets:
+        if len(tgt) >= 5:
+            _, cx, cy, bw, bh = tgt[:5]
+            x1 = int((cx - bw / 2) * W)
+            y1 = int((cy - bh / 2) * H)
+            x2 = int((cx + bw / 2) * W)
+            y2 = int((cy + bh / 2) * H)
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(W - 1, x2), min(H - 1, y2)
+            fg_mask[y1:y2, x1:x2] = 1.0
+
+    bg_mask = 1.0 - fg_mask
+
+    # --------------------------------------------------
+    # 2. BGR -> YUV
+    # --------------------------------------------------
+    img_yuv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2YUV).astype(np.float32) / 255.0
+
+    # --------------------------------------------------
+    # 3. Frequency grid & ring mask
+    # --------------------------------------------------
+    u = np.arange(H)[:, None]
+    v = np.arange(W)[None, :]
+    r = np.sqrt(u ** 2 + v ** 2)
+    r_norm = r / (r.max() + 1e-6)
+
+    ring_mask = (
+        np.exp(-(r_norm ** 2) / (2 * R_H ** 2))
+        - np.exp(-(r_norm ** 2) / (2 * R_L ** 2))
+    )
+    ring_mask = np.clip(ring_mask, 0.0, 1.0)
+
+    freq_weight = r_norm ** freq_gamma
+
+    # --------------------------------------------------
+    # 4. Channel-wise DCT + causal / non-causal perturb
+    # --------------------------------------------------
+    img_yuv_aug = img_yuv.copy()
+
+    for c in range(3):  # Y, U, V
+        X = img_yuv[:, :, c]
+        X_dct = dct(X)
+
+        C = X_dct * ring_mask
+        S = X_dct * (1.0 - ring_mask)
+
+        noise = np.random.randn(H, W)
+
+        strength_map = (
+            bg_strength[c] * bg_mask
+            + fg_strength[c] * fg_mask
+        )
+
+        S_perturbed = S * (1.0 + noise * strength_map * freq_weight)
+
+        X_dct_new = C + S_perturbed
+        X_new = idct(X_dct_new)
+        img_yuv_aug[:, :, c] = np.clip(X_new, 0.0, 1.0)
+
+    # --------------------------------------------------
+    # 5. YUV -> BGR
+    # --------------------------------------------------
+    out_aug = cv2.cvtColor(
+        (img_yuv_aug * 255.0).astype(np.uint8),
+        cv2.COLOR_YUV2BGR
+    )
+
+    # --------------------------------------------------
+    # 6. Linear blend
+    # --------------------------------------------------
+    out = (
+        mix_alpha * out_aug.astype(np.float32)
+        + (1.0 - mix_alpha) * img_bgr.astype(np.float32)
+    )
+    out = np.clip(out, 0, 255).astype(np.uint8)
+
+    return out

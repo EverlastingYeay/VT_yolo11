@@ -186,6 +186,10 @@ CFG_FRACTION_KEYS = frozenset(
         "conf",
         "iou",
         "fraction",
+        "vt_lambda_da",
+        "vt_lambda_consensus",
+        "vt_conf",
+        "vt_iou",
     }
 )
 CFG_INT_KEYS = frozenset(
@@ -201,6 +205,7 @@ CFG_INT_KEYS = frozenset(
         "line_width",
         "nbs",
         "save_period",
+        "vt_phase1_epochs",
     }
 )
 CFG_BOOL_KEYS = frozenset(
@@ -238,6 +243,9 @@ CFG_BOOL_KEYS = frozenset(
         "nms",
         "profile",
         "multi_scale",
+        "vt_source_weak",
+        "vt_val_target",
+        "vt_val_per_class",
     }
 )
 

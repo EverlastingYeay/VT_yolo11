@@ -18,6 +18,7 @@ from ultralytics.nn.modules import (
     C2PSA,
     C3,
     C3TR,
+    CBAM,
     ELAN1,
     OBB,
     PSA,
@@ -67,6 +68,8 @@ from ultralytics.nn.modules import (
     WorldDetect,
     YOLOEDetect,
     YOLOESegment,
+    VTImageDomainTap,
+    VTInstanceDomainTap,
     v10Detect,
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, YAML, colorstr, emojis
@@ -482,6 +485,8 @@ class DetectionModel(BaseModel):
     def init_criterion(self):
         """Initialize the loss criterion for the DetectionModel."""
         return E2EDetectLoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
+
+Model=DetectionModel
 
 
 class OBBModel(DetectionModel):
@@ -1611,6 +1616,12 @@ def parse_model(d, ch, verbose=True):
                 legacy = False
         elif m is AIFI:
             args = [ch[f], *args]
+        elif m is CBAM:
+            args = [ch[f], *args]
+            c2 = ch[f]
+        elif m in frozenset({VTImageDomainTap, VTInstanceDomainTap}):
+            args = [ch[f], *args]
+            c2 = ch[f]
         elif m in frozenset({HGStem, HGBlock}):
             c1, cm, c2 = ch[f], args[0], args[1]
             args = [c1, cm, c2, *args[2:]]
