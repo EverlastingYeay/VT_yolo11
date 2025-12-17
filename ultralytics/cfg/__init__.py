@@ -1,4 +1,4 @@
-# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+﻿# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
 from __future__ import annotations
 
@@ -246,6 +246,8 @@ CFG_BOOL_KEYS = frozenset(
         "vt_source_weak",
         "vt_val_target",
         "vt_val_per_class",
+        "vt_auto_pretrained",
+        "use_instance_masks",
     }
 )
 

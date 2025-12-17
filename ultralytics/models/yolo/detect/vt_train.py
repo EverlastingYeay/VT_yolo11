@@ -7,6 +7,7 @@ import time
 import warnings
 from copy import copy
 import json
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -54,6 +55,14 @@ def _set_instance_masks(model: nn.Module, masks: list[torch.Tensor] | None):
         raise ValueError(f"Expected {len(taps)} instance masks, got {len(masks)}.")
     for t, mask in zip(taps, masks):
         t.set_mask(mask)
+
+def _clear_vt_cache(model: nn.Module):
+    """Clear cached tensors on VT tap modules to keep EMA deepcopy safe."""
+    for m in _iter_domain_modules(model):
+        if hasattr(m, "last_logits"):
+            m.last_logits = None
+        if hasattr(m, "set_mask"):
+            m.set_mask(None)
 
 
 def _build_instance_masks_from_labels(
@@ -104,32 +113,36 @@ def _pseudo_labels_from_teacher_nms(
     nms_out: list[torch.Tensor],
     img_hw: tuple[int, int],
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build (batch_idx, cls, bboxes) tensors from Ultralytics NMS output."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build (batch_idx, cls, bboxes, conf) tensors from Ultralytics NMS output."""
     img_h, img_w = img_hw
     batch_idx_list: list[torch.Tensor] = []
     cls_list: list[torch.Tensor] = []
     bboxes_list: list[torch.Tensor] = []
+    conf_list: list[torch.Tensor] = []
     for i, det in enumerate(nms_out):
         if det is None or det.numel() == 0:
             continue
         # det: (N,6+extra) -> xyxy, conf, cls
         det = det[:, :6]
         xyxy = det[:, 0:4]
+        conf = det[:, 4:5]
         cls = det[:, 5:6]
         bboxes = xyxy2xywhn(xyxy, w=img_w, h=img_h, clip=True)  # normalized xywh
         batch_idx_list.append(torch.full((det.shape[0],), i, device=device, dtype=torch.int64))
         cls_list.append(cls.to(device=device, dtype=torch.float32))
         bboxes_list.append(bboxes.to(device=device, dtype=torch.float32))
+        conf_list.append(conf.to(device=device, dtype=torch.float32))
 
     if not batch_idx_list:
         return (
             torch.zeros((0,), device=device, dtype=torch.int64),
             torch.zeros((0, 1), device=device, dtype=torch.float32),
             torch.zeros((0, 4), device=device, dtype=torch.float32),
+            torch.zeros((0, 1), device=device, dtype=torch.float32),
         )
 
-    return torch.cat(batch_idx_list, 0), torch.cat(cls_list, 0), torch.cat(bboxes_list, 0)
+    return torch.cat(batch_idx_list, 0), torch.cat(cls_list, 0), torch.cat(bboxes_list, 0), torch.cat(conf_list, 0)
 
 
 def _cal_density_from_nms(nms_out: list[torch.Tensor], nc: int, device: torch.device) -> torch.Tensor:
@@ -185,6 +198,19 @@ def _apply_caps_filter(
 class VersatileTeacherTrainer(DetectionTrainer):
     """YOLO11 trainer with VersatileTeacher-style teacher-student domain adaptation."""
 
+    def setup_model(self):
+        # Ultralytics behavior: `pretrained=True` does not load weights when `model` is a YAML.
+
+        if isinstance(self.args.pretrained, bool) and self.args.pretrained and bool(getattr(self.args, "vt_auto_pretrained", True)):
+            model_path = str(self.args.model)
+            if model_path.endswith((".yaml", ".yml")):
+                # Prefer a local yolo11n.pt if present in the workspace.
+                candidate = Path.cwd() / "yolo11l.pt"
+                if candidate.exists():
+                    self.args.pretrained = str(candidate)
+                    LOGGER.info(f"VT init: using pretrained weights {candidate}")
+        return super().setup_model()
+
     def get_dataset(self):
         # Accept `data=[src.yaml, tgt.yaml]` (list/tuple) without guessing: rely on check_det_dataset.
         from ultralytics.data.utils import check_det_dataset
@@ -208,8 +234,10 @@ class VersatileTeacherTrainer(DetectionTrainer):
         self.args.vt_source_weak = bool(getattr(self.args, "vt_source_weak", True))
         self.args.vt_val_target = bool(getattr(self.args, "vt_val_target", True))
         self.args.vt_val_per_class = bool(getattr(self.args, "vt_val_per_class", True))
+        self.args.use_instance_masks = bool(getattr(self.args, "use_instance_masks", True))
         self._best_map50 = -1.0
         self._best_map5095 = -1.0
+        self._src_empty_steps = 0
 
         # Source augmentation policy:
         # - Recommended for UDA/VT: keep source "weak" (disable mosaic/mixup/copy-paste + strong HSV/geo),
@@ -311,23 +339,44 @@ class VersatileTeacherTrainer(DetectionTrainer):
         self.args.vt_conf = float(getattr(self.args, "vt_conf", 0.25))
         self.args.vt_iou = float(getattr(self.args, "vt_iou", 0.45))
         self.args.vt_phase1_epochs = int(getattr(self.args, "vt_phase1_epochs", 0))
+        self.args.vt_caps = bool(getattr(self.args, "vt_caps", True))
+        self.args.vt_caps_init = float(getattr(self.args, "vt_caps_init", 0.8))
+        self.args.vt_strong_enable = bool(getattr(self.args, "vt_strong_enable", True))
+        self.args.vt_strong_brightness = float(getattr(self.args, "vt_strong_brightness", 0.5))
+        self.args.vt_strong_contrast = float(getattr(self.args, "vt_strong_contrast", 0.5))
+        self.args.vt_strong_saturation = float(getattr(self.args, "vt_strong_saturation", 0.5))
+        self.args.vt_strong_hue = float(getattr(self.args, "vt_strong_hue", 0.5))
+        self.args.vt_strong_blur_kernel = int(getattr(self.args, "vt_strong_blur_kernel", 5))
+        self.args.vt_strong_erasing_p = float(getattr(self.args, "vt_strong_erasing_p", 0.5))
 
         self._ce = nn.CrossEntropyLoss()
         self._bce = nn.BCEWithLogitsLoss()
         self.loss_names = ("box_loss", "cls_loss", "dfl_loss", "img_da", "ins_da", "cons")
 
-        # Strong augmentation for target student branch (matches VersatileTeacher torchvison implementation).
-        self._strong_transform = transforms.Compose(
-            [
-                transforms.ColorJitter(brightness=0.5, contrast=0.5, saturation=0.5, hue=0.5),
-                transforms.GaussianBlur(kernel_size=5),
-                transforms.RandomErasing(p=0.5),
-            ]
-        )
+        # Strong augmentation for target student branch (configurable via YAML).
+        strong_ops: list[nn.Module] = []
+        if self.args.vt_strong_enable:
+            cj = dict(
+                brightness=self.args.vt_strong_brightness,
+                contrast=self.args.vt_strong_contrast,
+                saturation=self.args.vt_strong_saturation,
+                hue=self.args.vt_strong_hue,
+            )
+            if any(float(v) > 0 for v in cj.values()):
+                strong_ops.append(transforms.ColorJitter(**cj))
+            k = int(self.args.vt_strong_blur_kernel)
+            if k and k >= 3:
+                if k % 2 == 0:  # GaussianBlur requires odd kernel size
+                    k += 1
+                strong_ops.append(transforms.GaussianBlur(kernel_size=k))
+            if float(self.args.vt_strong_erasing_p) > 0:
+                strong_ops.append(transforms.RandomErasing(p=float(self.args.vt_strong_erasing_p)))
+        self._strong_transform = transforms.Compose(strong_ops)
 
         # CAPS (class-adaptive pseudo-label selection) state
         nc = int(getattr(unwrap_model(self.model).model[-1], "nc", 0) or 0)
-        self._cls_conf_thres = torch.full((nc,), 0.8, device=self.device, dtype=torch.float32)
+        self._cls_conf_thres = torch.full((nc,), self.args.vt_caps_init, device=self.device, dtype=torch.float32)
+        self._pl_cls_names = self.data_tgt.get("names", None) if isinstance(getattr(self, "data_tgt", None), dict) else None
 
     @staticmethod
     def _metric_value(metrics: dict, key: str) -> float | None:
@@ -391,6 +440,70 @@ class VersatileTeacherTrainer(DetectionTrainer):
             (self.save_dir / "best_mAP50_95_metrics.json").write_text(
                 json.dumps(payload, ensure_ascii=False, indent=2, default=_jsonify)
             )
+
+    @staticmethod
+    def _to_float(v):
+        try:
+            return float(v)
+        except Exception:
+            return v
+
+    def _save_epoch_csv(self, val_metrics: dict | None):
+        """Append one epoch of VT training + target val metrics to results.csv."""
+        if RANK not in {-1, 0}:
+            return
+
+        # Training losses (VT-extended) are stored in self.tloss (mean over steps), length 6.
+        train_vals = {}
+        if isinstance(getattr(self, "tloss", None), torch.Tensor) and self.tloss.numel() >= 6:
+            names = ("box_loss", "cls_loss", "dfl_loss", "img_da", "ins_da", "cons")
+            for k, x in zip(names, self.tloss.detach().cpu().tolist()[:6]):
+                train_vals[f"train/{k}"] = self._to_float(x)
+
+        # Target validation metrics (GT only for evaluation).
+        val_vals = {}
+        if isinstance(val_metrics, dict):
+            key_map = {
+                "metrics/precision(B)": "val_tgt/precision(B)",
+                "metrics/recall(B)": "val_tgt/recall(B)",
+                "metrics/mAP50(B)": "val_tgt/mAP50(B)",
+                "metrics/mAP50-95(B)": "val_tgt/mAP50-95(B)",
+                "val/box_loss": "val_tgt/box_loss",
+                "val/cls_loss": "val_tgt/cls_loss",
+                "val/dfl_loss": "val_tgt/dfl_loss",
+            }
+            for src_k, dst_k in key_map.items():
+                if src_k in val_metrics:
+                    val_vals[dst_k] = self._to_float(val_metrics[src_k])
+
+        # Pseudo-label stats to help analyze VT effectiveness.
+        pl_vals = {}
+        denom = max(int(getattr(self, "_pl_img_total", 0)), 1)
+        pl_vals["train/pl_total"] = int(getattr(self, "_pl_total", 0))
+        pl_vals["train/pl_per_img"] = float(getattr(self, "_pl_total", 0) / denom)
+        pl_vals["train/pl_img_ratio"] = float(getattr(self, "_pl_img_with", 0) / denom)
+        pl_conf_count = int(getattr(self, "_pl_conf_count", 0))
+        pl_conf_sum = float(getattr(self, "_pl_conf_sum", 0.0))
+        pl_vals["train/pl_mean_conf"] = float(pl_conf_sum / max(pl_conf_count, 1))
+        if hasattr(self, "_cls_conf_thres") and isinstance(self._cls_conf_thres, torch.Tensor):
+            pl_vals["train/caps_thres_mean"] = float(self._cls_conf_thres.mean().detach().cpu())
+        if hasattr(self, "_pl_conf_hist") and isinstance(self._pl_conf_hist, torch.Tensor):
+            for bi, v in enumerate(self._pl_conf_hist.detach().cpu().to(dtype=torch.long).tolist()):
+                pl_vals[f"train/pl_conf_hist/{bi}"] = int(v)
+        if hasattr(self, "_pl_cls_hist") and isinstance(self._pl_cls_hist, torch.Tensor):
+            cls_hist = self._pl_cls_hist.detach().cpu().to(dtype=torch.long).tolist()
+            names = getattr(self, "_pl_cls_names", None)
+            for ci, v in enumerate(cls_hist):
+                if names and ci < len(names):
+                    name = str(names[ci]).replace("/", "_").replace("\\", "_").strip() or str(ci)
+                    pl_vals[f"train/pl_cls_hist/{name}"] = int(v)
+                else:
+                    pl_vals[f"train/pl_cls_hist/{ci}"] = int(v)
+
+        # Learning rates
+        lr_vals = {f"lr/pg{i}": float(x["lr"]) for i, x in enumerate(self.optimizer.param_groups)}
+
+        self.save_metrics(metrics={**train_vals, **val_vals, **pl_vals, **lr_vals})
 
     def validate(self):
         """Validate on target domain by default (GT only for evaluation)."""
@@ -471,12 +584,19 @@ class VersatileTeacherTrainer(DetectionTrainer):
                 self.train_loader.sampler.set_epoch(epoch)
                 self.train_loader_tgt.sampler.set_epoch(epoch)
 
+            # 然后决定是否调用instance_masks
+            if self.args.use_instance_masks:
+                _set_instance_masks(self.model, _build_instance_masks_from_labels(batch_src, strides))
+            else:
+                _set_instance_masks(self.model, None)
+
             # Phase transition: after phase-1, initialize student/teacher from phase-1 teacher (EMA) weights.
             if self.args.vt_phase1_epochs > 0 and epoch == self.args.vt_phase1_epochs:
                 with torch.no_grad():
                     unwrap_model(self.model).load_state_dict(unwrap_model(self.ema.ema).state_dict(), strict=True)
                 from ultralytics.utils.torch_utils import ModelEMA
 
+                _clear_vt_cache(self.model)
                 self.ema = ModelEMA(self.model)
 
             it_src = iter(self.train_loader)
@@ -487,6 +607,14 @@ class VersatileTeacherTrainer(DetectionTrainer):
                 pbar = TQDM(pbar, total=nb)
 
             self.tloss = None
+            self._pl_total = 0
+            self._pl_img_with = 0
+            self._pl_img_total = 0
+            self._pl_conf_sum = 0.0
+            self._pl_conf_count = 0
+            self._pl_conf_hist = torch.zeros((10,), device="cpu", dtype=torch.long)
+            nc = int(getattr(unwrap_model(self.model).model[-1], "nc", 0) or 0)
+            self._pl_cls_hist = torch.zeros((nc,), device="cpu", dtype=torch.long)
             for i in pbar:
                 self.run_callbacks("on_train_batch_start")
                 ni = i + nb * epoch
@@ -515,6 +643,19 @@ class VersatileTeacherTrainer(DetectionTrainer):
                     batch_src = self.preprocess_batch(batch_src)
                     batch_tgt = self.preprocess_batch(batch_tgt)
                     img_tgt_weak = batch_tgt["img"]  # weak: no extra augmentation beyond dataloader pipeline
+
+                    # Sanity-check: UDA requires labeled source. If source has no labels, detection loss collapses and mAP stays 0.
+                    n_src = int(batch_src.get("cls", torch.zeros(0)).shape[0])
+                    if n_src == 0:
+                        self._src_empty_steps += 1
+                    else:
+                        self._src_empty_steps = 0
+                    if self._src_empty_steps >= 50 and RANK in {-1, 0}:
+                        raise RuntimeError(
+                            "Source batches contain 0 labeled instances for 50 consecutive steps. "
+                            "Please verify your source dataset is correctly labeled in YOLO format "
+                            "(images + matching label txt files) and that the `train:` path in the source YAML is correct."
+                        )
 
                     # --- Source: supervised detection loss + domain losses
                     strides = unwrap_model(self.model).stride
@@ -551,25 +692,40 @@ class VersatileTeacherTrainer(DetectionTrainer):
                                 max_det=300,
                                 nc=int(getattr(unwrap_model(self.model).model[-1], "nc", 0) or 0),
                             )
-                            # CAPS update + filter (Ultralytics NMS is global-threshold; CAPS is applied post-NMS)
-                            alpha_conf = 1.0 - cosine_decay.cal_alpha_conf(ni)
-                            conf_delta = _cal_density_from_nms(nms_out, nc=self._cls_conf_thres.numel(), device=self.device)
-                            low = conf_delta < 0.05
-                            conf_delta[low] = self._cls_conf_thres[low]
-                            self._cls_conf_thres = self._cls_conf_thres * alpha_conf + conf_delta * (1.0 - alpha_conf)
-                            nms_out = _apply_caps_filter(nms_out, self._cls_conf_thres, device=self.device)
-
                             _, _, h, w = img_tgt_weak.shape
-                            p_batch_idx, p_cls, p_bboxes = _pseudo_labels_from_teacher_nms(
+                            if self.args.vt_caps:
+                                # CAPS update + filter (Ultralytics NMS is global-threshold; CAPS is applied post-NMS)
+                                alpha_conf = 1.0 - cosine_decay.cal_alpha_conf(ni)
+                                conf_delta = _cal_density_from_nms(nms_out, nc=self._cls_conf_thres.numel(), device=self.device)
+                                low = conf_delta < 0.05
+                                conf_delta[low] = self._cls_conf_thres[low]
+                                self._cls_conf_thres = self._cls_conf_thres * alpha_conf + conf_delta * (1.0 - alpha_conf)
+                                nms_out = _apply_caps_filter(nms_out, self._cls_conf_thres, device=self.device)
+
+                            p_batch_idx, p_cls, p_bboxes, p_conf = _pseudo_labels_from_teacher_nms(
                                 nms_out, img_hw=(h, w), device=batch_tgt["img"].device
                             )
+                            # Pseudo-label statistics for analysis
+                            bsz = int(img_tgt_weak.shape[0])
+                            self._pl_total += int(p_cls.shape[0])
+                            self._pl_img_total += bsz
+                            if p_batch_idx.numel():
+                                self._pl_img_with += int(torch.unique(p_batch_idx).numel())
+                            if p_conf.numel():
+                                self._pl_conf_sum += float(p_conf.detach().sum().cpu())
+                                self._pl_conf_count += int(p_conf.numel())
+                                conf_bins = (p_conf.detach().flatten().cpu().clamp(0.0, 0.99) * 10.0).to(dtype=torch.long)
+                                self._pl_conf_hist += torch.bincount(conf_bins, minlength=10).to(dtype=torch.long)
+                            if p_cls.numel():
+                                cls_ids = p_cls.detach().flatten().cpu().to(dtype=torch.long)
+                                self._pl_cls_hist += torch.bincount(cls_ids, minlength=self._pl_cls_hist.numel()).to(dtype=torch.long)
 
                         pseudo_batch = dict(batch_tgt)
                         pseudo_batch["batch_idx"] = p_batch_idx
                         pseudo_batch["cls"] = p_cls
                         pseudo_batch["bboxes"] = p_bboxes
                         # strong: apply additional strong augmentation only on the student branch
-                        pseudo_batch["img"] = self._strong_transform(img_tgt_weak)
+                        pseudo_batch["img"] = self._strong_transform(img_tgt_weak) if self.args.vt_strong_enable else img_tgt_weak
 
                         _set_instance_masks(self.model, _build_instance_masks_from_labels(pseudo_batch, strides))
                         loss_tgt, loss_items_tgt = self.model(pseudo_batch)
@@ -615,6 +771,10 @@ class VersatileTeacherTrainer(DetectionTrainer):
                     self.loss_items = loss_items_src.detach()
                     # Track VT-extended items separately for progress display.
                     self.vt_loss_items = loss_items
+
+                    # Important: clear cached tensors so ModelEMA deepcopy remains safe (phase switch etc.).
+                    # The autograd graph is already retained by `loss` and does not rely on module attributes.
+                    _clear_vt_cache(self.model)
                     if RANK != -1:
                         self.loss *= self.world_size
                     self.tloss = (
@@ -653,6 +813,7 @@ class VersatileTeacherTrainer(DetectionTrainer):
                 self.ema.update_attr(self.model, include=["yaml", "nc", "args", "names", "stride", "class_weights"])
                 self.save_model()
                 self.metrics, self.fitness = self.validate()
+                self._save_epoch_csv(self.metrics)
                 self.stop |= (epoch + 1) >= self.epochs
 
             self.run_callbacks("on_fit_epoch_end")

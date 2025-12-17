@@ -1689,7 +1689,8 @@ def yaml_model_load(path):
     unified_path = re.sub(r"(\d+)([nslmx])(.+)?$", r"\1\3", str(path))  # i.e. yolov8x.yaml -> yolov8.yaml
     yaml_file = check_yaml(unified_path, hard=False) or check_yaml(path)
     d = YAML.load(yaml_file)  # model dict
-    d["scale"] = guess_model_scale(path)
+    # If YAML explicitly defines `scale`, preserve it. Otherwise, infer from filename (e.g. yolo11n.yaml -> 'n').
+    d["scale"] = d.get("scale") or guess_model_scale(path)
     d["yaml_file"] = str(path)
     return d
 

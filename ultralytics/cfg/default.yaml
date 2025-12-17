@@ -1,4 +1,4 @@
-# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+﻿# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
 # Global configuration YAML with settings and hyperparameters for YOLO training, validation, prediction and export
 # For documentation see https://docs.ultralytics.com/usage/cfg/
@@ -128,6 +128,17 @@ vt_phase1_epochs: 0 # (int) phase-1 epochs (domain-aware pretraining, no pseudo-
 vt_source_weak: True # (bool) disable heavy YOLO augs on source (mosaic/mixup/copy-paste + strong HSV/geo)
 vt_val_target: True # (bool) validate on target domain (GT only for evaluation)
 vt_val_per_class: True # (bool) print per-class metrics during training/validation
+vt_auto_pretrained: True # (bool) if model is YAML and pretrained=True, auto-init from local yolo11n.pt when available
+vt_caps: false # (bool) enable CAPS class-adaptive pseudo-label filtering (post-NMS)
+vt_caps_init: 0.4 # (float) CAPS initial per-class confidence threshold (0.0-1.0)
+vt_strong_enable: True # (bool) enable strong augmentation on target student branch
+vt_strong_brightness: 0.5 # (float) ColorJitter brightness strength (0 disables)
+vt_strong_contrast: 0.5 # (float) ColorJitter contrast strength (0 disables)
+vt_strong_saturation: 0.5 # (float) ColorJitter saturation strength (0 disables)
+vt_strong_hue: 0.1 # (float) ColorJitter hue strength (0 disables)
+vt_strong_blur_kernel: 5 # (int) GaussianBlur kernel size (odd >=3, 0 disables)
+vt_strong_erasing_p: 0.1 # (float) RandomErasing probability (0 disables)
+use_instance_masks: false # (bool) enable instance masks for instance-domain tap (VT)
 copy_paste: 0.0 # (float) segmentation copy-paste probability
 copy_paste_mode: flip # (str) copy-paste strategy for segmentation: flip or mixup
 auto_augment: randaugment # (str) classification auto augmentation policy: randaugment, autoaugment, augmix
