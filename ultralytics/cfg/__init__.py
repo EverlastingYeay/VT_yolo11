@@ -159,6 +159,8 @@ CFG_FLOAT_KEYS = frozenset(
         "time",
         "workspace",
         "batch",
+        "vt_caps_gamma",
+        "vt_pl_weight_cap",
     }
 )
 CFG_FRACTION_KEYS = frozenset(
@@ -190,6 +192,8 @@ CFG_FRACTION_KEYS = frozenset(
         "vt_lambda_consensus",
         "vt_conf",
         "vt_iou",
+        "vt_caps_q",
+        "vt_caps_tau",
     }
 )
 CFG_INT_KEYS = frozenset(
@@ -206,6 +210,8 @@ CFG_INT_KEYS = frozenset(
         "nbs",
         "save_period",
         "vt_phase1_epochs",
+        "vt_pl_warmup_epochs",
+        "vt_da_warmup_epochs",
     }
 )
 CFG_BOOL_KEYS = frozenset(

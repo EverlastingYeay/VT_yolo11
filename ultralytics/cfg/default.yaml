@@ -9,7 +9,7 @@ mode: train # (str) YOLO mode, i.e. train, val, predict, export, track, benchmar
 # Train settings -------------------------------------------------------------------------------------------------------
 model: # (str, optional) path to model file, i.e. yolov8n.pt or yolov8n.yaml
 data: # (str, optional) path to data file, i.e. coco8.yaml
-epochs: 100 # (int) number of epochs to train for
+epochs: 500 # (int) number of epochs to train for
 time: # (float, optional) max hours to train; overrides epochs if set
 patience: 100 # (int) early stop after N epochs without val improvement
 batch: 4 # (int) batch size; use -1 for AutoBatch
@@ -122,15 +122,21 @@ cutmix: 0.0 # (float) CutMix augmentation probability
 # VersatileTeacher (teacher-student domain adaptation) ---------------------------------------------------------------
 vt_lambda_da: 0.1 # (float) domain adaptation loss weight
 vt_lambda_consensus: 0.1 # (float) image/instance consensus loss weight
-vt_conf: 0.25 # (float) confidence threshold for teacher pseudo-label NMS
+vt_conf: 0.2 # (float) confidence threshold for teacher pseudo-label NMS (VT uses 0.2 for CAPS density)
 vt_iou: 0.45 # (float) IoU threshold for teacher pseudo-label NMS
 vt_phase1_epochs: 0 # (int) phase-1 epochs (domain-aware pretraining, no pseudo-labels); 0 disables
 vt_source_weak: True # (bool) disable heavy YOLO augs on source (mosaic/mixup/copy-paste + strong HSV/geo)
 vt_val_target: True # (bool) validate on target domain (GT only for evaluation)
 vt_val_per_class: True # (bool) print per-class metrics during training/validation
 vt_auto_pretrained: True # (bool) if model is YAML and pretrained=True, auto-init from local yolo11n.pt when available
-vt_caps: false # (bool) enable CAPS class-adaptive pseudo-label filtering (post-NMS)
-vt_caps_init: 0.4 # (float) CAPS initial per-class confidence threshold (0.0-1.0)
+vt_caps_q: 0.9 # (float) CAPS per-class confidence quantile (precision-first: higher)
+vt_caps_gamma: 2.0 # (float) pseudo-label soft weight sharpness (w^gamma), higher -> more precision-focused
+vt_caps_tau: 0.05 # (float) soft-weight temperature for sigmoid((conf-thr)/tau); smaller -> more precision
+vt_pl_warmup_epochs: 0 # (int) phase-2 pseudo-label loss warmup epochs (0 disables, VT default)
+vt_pl_weight_cap: 1.0 # (float) cap on pseudo-label batch mean weight after CAPS (0..1)
+vt_da_warmup_epochs: 0 # (int) phase-2 DA loss warmup epochs (0 disables)
+vt_caps: true # (bool) enable CAPS class-adaptive pseudo-label filtering (post-NMS)
+vt_caps_init: 0.8 # (float) CAPS initial per-class confidence threshold (VT default)
 vt_strong_enable: True # (bool) enable strong augmentation on target student branch
 vt_strong_brightness: 0.5 # (float) ColorJitter brightness strength (0 disables)
 vt_strong_contrast: 0.5 # (float) ColorJitter contrast strength (0 disables)

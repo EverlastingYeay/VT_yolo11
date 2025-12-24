@@ -1,9 +1,8 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
 # YOLO11 + VersatileTeacher (teacher-student cross-domain) taps.
-# This config keeps the standard YOLO11 Detect head, and adds:
-# - CBAM refinement on P3/P4/P5 features before Detect
-# - Image/Instance domain-classifier "taps" that do not alter the forward tensor
+# This config keeps the standard YOLO11 Detect head, and adds
+# Image/Instance domain-classifier "taps" that do not alter the forward tensor.
 
 # Parameters
 nc: 80 # number of classes
@@ -48,18 +47,14 @@ head:
   - [[-1, 10], 1, Concat, [1]] # cat head P5
   - [-1, 2, C3k2, [1024, True]] # 22 (P5/32-large)
 
-  # CBAM on multi-scale features (P3, P4, P5)
-  - [16, 1, CBAM, [7]] # 23
-  - [19, 1, CBAM, [7]] # 24
-  - [22, 1, CBAM, [7]] # 25
+  # Domain-classifier placement (aligned with VersatileTeacher yolov5l_da.yaml intent):
+  # - Image-level taps on backbone features (P3/P4/P5): layers 4, 6, 8 (align with VT yolov5l_da.yaml)
+  # - Instance-level taps on head features before Detect (P3/P4/P5): layers 16, 19, 22
+  - [4, 1, VTImageDomainTap, [80, 0.1]] # 26 (backbone P3, 640/8=80)
+  - [6, 1, VTImageDomainTap, [40, 0.1]] # 27 (backbone P4, 640/16=40)
+  - [8, 1, VTImageDomainTap, [20, 0.1]] # 28 (backbone P5, 640/32=20)
+  - [16, 1, VTInstanceDomainTap, [0.1, True]] # 29
+  - [19, 1, VTInstanceDomainTap, [0.1, True]] # 30
+  - [22, 1, VTInstanceDomainTap, [0.1, True]] # 31
 
-  # Domain-classifier taps (Trainer reads stored logits)
-  - [23, 1, VTImageDomainTap, [0.1]] # 26
-  - [24, 1, VTImageDomainTap, [0.1]] # 27
-  - [25, 1, VTImageDomainTap, [0.1]] # 28
-  - [23, 1, VTInstanceDomainTap, [0.1, True]] # 29
-  - [24, 1, VTInstanceDomainTap, [0.1, True]] # 30
-  - [25, 1, VTInstanceDomainTap, [0.1, True]] # 31
-
-  - [[23, 24, 25], 1, Detect, [nc]] # 32 Detect(P3, P4, P5)
-
+  - [[16, 19, 22], 1, Detect, [nc]] # 32 Detect(P3, P4, P5)

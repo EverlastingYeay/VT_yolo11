@@ -27,19 +27,26 @@ def grad_reverse(x: torch.Tensor, lambd: float) -> torch.Tensor:
 
 
 class VTImageDomainTap(nn.Module):
-    """Image-level domain classifier that does not change the forward tensor.
+    """Image-level domain classifier tap (VersatileTeacher-style).
 
-    This module is intended to be inserted into the model graph as a 'tap': it runs a
-    small classifier on the incoming feature map, stores the logits to be consumed by
-    the Trainer, and returns the original feature map unchanged.
+    Matches the original VT `ImageDomainClassifier` structure:
+    GRL -> Conv(c->c,3x3) -> ReLU -> Conv(c->1,1x1) -> Flatten(HW) -> Linear(HW->2).
+
+    Implemented as a 'tap': stores logits for the Trainer but returns the input feature unchanged.
     """
 
-    def __init__(self, c1: int, grl_lambda: float = 0.1, num_domains: int = 2):
+    def __init__(self, c1: int, size: int, grl_lambda: float = 0.1, num_domains: int = 2):
         super().__init__()
+        self.size = int(size)
         self.grl_lambda = float(grl_lambda)
         self.num_domains = int(num_domains)
-        self.pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Linear(c1, self.num_domains)
+        self.conv = nn.Sequential(
+            nn.Conv2d(c1, c1, kernel_size=3, padding=1, stride=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(c1, 1, kernel_size=1),
+        )
+        self.pool = nn.AdaptiveAvgPool2d((self.size, self.size))
+        self.fc = nn.Linear(self.size * self.size, self.num_domains)
         self.last_logits: torch.Tensor | None = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -50,8 +57,14 @@ class VTImageDomainTap(nn.Module):
             return x
 
         z = grad_reverse(x, self.grl_lambda)
-        z = self.pool(z).flatten(1)
-        self.last_logits = self.fc(z)
+        # Defensive: ensure (B, C, H, W) so Linear always receives a 2D (B, S*S) matrix.
+        if z.ndim == 3:
+            z = z.unsqueeze(0)
+        z = self.conv(z)  # (B, 1, H, W)
+        z = self.pool(z)  # (B, 1, S, S)
+        z = z.flatten(1)  # (B, S*S)
+        # Ensure stable 2D logits for CE loss even if a caller provides an unexpected shape.
+        self.last_logits = self.fc(z).reshape(-1, self.num_domains)  # (B, 2)
         return x
 
 

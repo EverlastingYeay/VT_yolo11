@@ -12,13 +12,14 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision.transforms as transforms
 
 from ultralytics.data import build_dataloader, build_yolo_dataset
 from ultralytics.nn.modules.vt import VTImageDomainTap, VTInstanceDomainTap
 from ultralytics.utils import LOGGER, LOCAL_RANK, RANK, TQDM
 from ultralytics.utils.nms import non_max_suppression
-from ultralytics.utils.ops import xyxy2xywhn
+from ultralytics.utils.ops import xywh2xyxy, xyxy2xywhn
 from ultralytics.utils.torch_utils import autocast, unwrap_model
 
 from .train import DetectionTrainer
@@ -38,7 +39,11 @@ def _get_vt_logits(model: nn.Module) -> tuple[list[torch.Tensor], list[torch.Ten
     image_logits, instance_logits = [], []
     for m in _iter_domain_modules(model):
         if isinstance(m, VTImageDomainTap) and m.last_logits is not None:
-            image_logits.append(m.last_logits)
+            lg = m.last_logits
+            # Defensive: image logits should be (B, 2) for CrossEntropyLoss.
+            if lg.ndim == 1:
+                lg = lg.unsqueeze(0)
+            image_logits.append(lg)
         elif isinstance(m, VTInstanceDomainTap) and m.last_logits is not None:
             instance_logits.append(m.last_logits)
     return image_logits, instance_logits
@@ -69,7 +74,13 @@ def _build_instance_masks_from_labels(
     batch: dict[str, torch.Tensor],
     strides: torch.Tensor,
 ) -> list[torch.Tensor]:
-    """Create (B,H,W) masks for each stride level from normalized xywh labels."""
+    """Create (B,H,W) masks for each stride level from normalized xywh labels (VT-style).
+
+    Aligns with VersatileTeacher `generate_mask_from_labels()`:
+    - base noise: N(0,1)/50 + 0.05
+    - inside-box region: ~0.85-0.95
+    - Gaussian blur per scale (kernel sizes 7/5/3, sigma in [0.5, 1.5])
+    """
     imgs = batch["img"]
     bboxes = batch["bboxes"]
     batch_idx = batch["batch_idx"]
@@ -77,34 +88,50 @@ def _build_instance_masks_from_labels(
     bsz, _, img_h, img_w = imgs.shape
     device = imgs.device
 
-    # base mask values
     masks: list[torch.Tensor] = []
-    for s in strides.tolist():
+    strides_list = [int(s) for s in strides.tolist()]
+    kernel_sizes = [7, 5, 3]  # P3/P4/P5 like VT (80/40/20)
+    for s in strides_list:
         gh, gw = int(img_h / s), int(img_w / s)
-        masks.append(torch.full((bsz, gh, gw), 0.05, device=device, dtype=torch.float32))
+        masks.append(torch.randn((bsz, gh, gw), device=device, dtype=torch.float32) / 50.0 + 0.05)
 
     if bboxes.numel() == 0:
         return masks
 
+    def _gaussian_blur_bhw(x: torch.Tensor, k: int, sigma: float) -> torch.Tensor:
+        if k <= 1:
+            return x
+        dtype = x.dtype
+        ax = torch.arange(k, device=x.device, dtype=dtype) - (k - 1) / 2.0
+        yy, xx = torch.meshgrid(ax, ax, indexing="ij")
+        kernel = torch.exp(-(xx * xx + yy * yy) / (2.0 * (sigma**2)))
+        kernel = kernel / kernel.sum()
+        kernel = kernel.view(1, 1, k, k)
+        return F.conv2d(x.unsqueeze(1), kernel, padding=k // 2).squeeze(1)
+
     # bboxes are normalized xywh (0..1), batch_idx indexes images in batch
     for bi, (xc, yc, bw, bh) in zip(batch_idx.tolist(), bboxes.tolist()):
-        bi = int(bi)  # batch_idx is float in Ultralytics Format() then collated; cast for indexing
+        bi = int(bi)
         if bi < 0 or bi >= bsz:
             continue
-        # convert to pixel xyxy
-        x1 = (xc - bw / 2) * img_w
-        y1 = (yc - bh / 2) * img_h
-        x2 = (xc + bw / 2) * img_w
-        y2 = (yc + bh / 2) * img_h
-
-        for mi, s in enumerate(strides.tolist()):
+        for mi, _s in enumerate(strides_list):
             gh, gw = masks[mi].shape[-2:]
-            gx1 = int(max(0, math.floor(x1 / s)))
-            gy1 = int(max(0, math.floor(y1 / s)))
-            gx2 = int(min(gw - 1, math.ceil(x2 / s)))
-            gy2 = int(min(gh - 1, math.ceil(y2 / s)))
-            if gx2 >= gx1 and gy2 >= gy1:
-                masks[mi][bi, gy1 : gy2 + 1, gx1 : gx2 + 1] = 0.95
+            x = int(xc * gw)
+            y = int(yc * gh)
+            ww = int(bw * gw / 2.0)
+            hh = int(bh * gh / 2.0)
+            x1 = max(0, x - ww)
+            x2 = min(gh - 1, x + ww)
+            y1 = max(0, y - hh)
+            y2 = min(gw - 1, y + hh)
+            if x2 >= x1 and y2 >= y1:
+                val = float(0.85 + torch.rand(1, device=device).item() * 0.1)
+                masks[mi][bi, x1 : x2 + 1, y1 : y2 + 1] = val
+
+    for mi in range(len(masks)):
+        k = kernel_sizes[mi] if mi < len(kernel_sizes) else 3
+        sigma = float(torch.empty(1, device=device).uniform_(0.5, 1.5).item())
+        masks[mi] = _gaussian_blur_bhw(masks[mi], k=k, sigma=sigma)
 
     return masks
 
@@ -164,6 +191,78 @@ def _cal_density_from_nms(nms_out: list[torch.Tensor], nc: int, device: torch.de
     return torch.argmax(density, dim=1).to(dtype=torch.float32) / 10.0
 
 
+def _nms_per_class_conf_thres(
+    prediction: torch.Tensor,
+    cls_conf_thres: torch.Tensor,
+    iou_thres: float,
+    max_det: int,
+    nc: int,
+    max_wh: int = 7680,
+    max_nms: int = 30000,
+) -> list[torch.Tensor]:
+    """NMS with per-class confidence thresholding (VT reproduction).
+
+    Ultralytics `non_max_suppression()` currently only accepts float `conf_thres`. VersatileTeacher uses a per-class
+    tensor for the second-stage NMS: keep a box if conf(box) > cls_conf_thres[argmax_class]. This function reproduces
+    that behavior for YOLO11 outputs (BCN format).
+    """
+    if isinstance(prediction, (list, tuple)):
+        prediction = prediction[0]
+    bs = prediction.shape[0]
+    extra = prediction.shape[1] - nc - 4
+    pred = prediction.transpose(-1, -2)  # (B, N, 4+nc+extra)
+    pred[..., :4] = xywh2xyxy(pred[..., :4])
+
+    # ensure thresholds on correct device
+    cls_conf_thres = cls_conf_thres.to(device=prediction.device, dtype=torch.float32)
+
+    import torchvision  # required for torchvision.ops.nms
+
+    out: list[torch.Tensor] = [torch.zeros((0, 6 + extra), device=prediction.device)] * bs
+    for xi, x in enumerate(pred):
+        box, cls, mask = x.split((4, nc, extra), 1)
+        conf, j = cls.max(1, keepdim=True)  # (N,1)
+        th = cls_conf_thres[j.view(-1).long()].view(-1, 1)
+        keep = conf > th
+        x = torch.cat((box, conf, j.float(), mask), 1)[keep.view(-1)]
+        n = x.shape[0]
+        if not n:
+            continue
+        if n > max_nms:
+            x = x[x[:, 4].argsort(descending=True)[:max_nms]]
+        c = x[:, 5:6] * max_wh
+        boxes = x[:, :4] + c
+        scores = x[:, 4]
+        i = torchvision.ops.nms(boxes, scores, float(iou_thres))[:max_det]
+        out[xi] = x[i]
+    return out
+
+
+def _cal_quantile_from_nms(nms_out: list[torch.Tensor], nc: int, q: float, device: torch.device) -> torch.Tensor:
+    """Compute per-class confidence quantile from NMS output (post-NMS).
+
+    Returns zeros for classes with no detections.
+    """
+    confs_by_class: list[list[float]] = [[] for _ in range(nc)]
+    for det in nms_out:
+        if det is None or det.numel() == 0:
+            continue
+        det6 = det[:, :6]
+        conf = det6[:, 4].clamp(max=0.999).detach().to("cpu")
+        cls = det6[:, 5].to(dtype=torch.long).detach().to("cpu")
+        for c, s in zip(cls.tolist(), conf.tolist()):
+            if 0 <= c < nc:
+                confs_by_class[c].append(float(s))
+
+    out = torch.zeros((nc,), device=device, dtype=torch.float32)
+    q = float(q)
+    for c in range(nc):
+        if confs_by_class[c]:
+            t = torch.tensor(confs_by_class[c], dtype=torch.float32, device=device)
+            out[c] = torch.quantile(t, q).clamp(0.0, 0.999)
+    return out
+
+
 class _CosineDecayWithWarmup:
     """VersatileTeacher-style cosine decay with warmup for CAPS smoothing."""
 
@@ -195,6 +294,15 @@ def _apply_caps_filter(
     return out
 
 
+def _linear_warmup(step: int, warmup_steps: int) -> float:
+    """Return warmup factor in (0, 1], or 1.0 if disabled."""
+    warmup_steps = int(warmup_steps)
+    if warmup_steps <= 0:
+        return 1.0
+    step = max(int(step), 0)
+    return min(1.0, (step + 1) / warmup_steps)
+
+
 class VersatileTeacherTrainer(DetectionTrainer):
     """YOLO11 trainer with VersatileTeacher-style teacher-student domain adaptation."""
 
@@ -204,11 +312,19 @@ class VersatileTeacherTrainer(DetectionTrainer):
         if isinstance(self.args.pretrained, bool) and self.args.pretrained and bool(getattr(self.args, "vt_auto_pretrained", True)):
             model_path = str(self.args.model)
             if model_path.endswith((".yaml", ".yml")):
-                # Prefer a local yolo11n.pt if present in the workspace.
-                candidate = Path.cwd() / "yolo11l.pt"
-                if candidate.exists():
-                    self.args.pretrained = str(candidate)
-                    LOGGER.info(f"VT init: using pretrained weights {candidate}")
+                from ultralytics.nn.tasks import yaml_model_load
+
+                # Prefer a local `yolo11{scale}.pt` matching the YAML model scale (n/s/m/l/x), else fallback to `yolo11n.pt`.
+                scale = (yaml_model_load(model_path) or {}).get("scale") or "n"
+                candidates = [
+                    Path.cwd() / f"yolo11{scale}.pt",
+                    Path.cwd() / "yolo11n.pt",
+                ]
+                for candidate in candidates:
+                    if candidate.exists():
+                        self.args.pretrained = str(candidate)
+                        LOGGER.info(f"VT init: using pretrained weights {candidate}")
+                        break
         return super().setup_model()
 
     def get_dataset(self):
@@ -341,6 +457,12 @@ class VersatileTeacherTrainer(DetectionTrainer):
         self.args.vt_phase1_epochs = int(getattr(self.args, "vt_phase1_epochs", 0))
         self.args.vt_caps = bool(getattr(self.args, "vt_caps", True))
         self.args.vt_caps_init = float(getattr(self.args, "vt_caps_init", 0.8))
+        self.args.vt_caps_q = float(getattr(self.args, "vt_caps_q", 0.9))
+        self.args.vt_caps_gamma = float(getattr(self.args, "vt_caps_gamma", 2.0))
+        self.args.vt_caps_tau = float(getattr(self.args, "vt_caps_tau", 0.05))
+        self.args.vt_pl_warmup_epochs = int(getattr(self.args, "vt_pl_warmup_epochs", 0))
+        self.args.vt_pl_weight_cap = float(getattr(self.args, "vt_pl_weight_cap", 1.0))
+        self.args.vt_da_warmup_epochs = int(getattr(self.args, "vt_da_warmup_epochs", 0))
         self.args.vt_strong_enable = bool(getattr(self.args, "vt_strong_enable", True))
         self.args.vt_strong_brightness = float(getattr(self.args, "vt_strong_brightness", 0.5))
         self.args.vt_strong_contrast = float(getattr(self.args, "vt_strong_contrast", 0.5))
@@ -485,6 +607,12 @@ class VersatileTeacherTrainer(DetectionTrainer):
         pl_conf_count = int(getattr(self, "_pl_conf_count", 0))
         pl_conf_sum = float(getattr(self, "_pl_conf_sum", 0.0))
         pl_vals["train/pl_mean_conf"] = float(pl_conf_sum / max(pl_conf_count, 1))
+        pl_w_count = int(getattr(self, "_pl_w_count", 0))
+        pl_w_sum = float(getattr(self, "_pl_w_sum", 0.0))
+        pl_vals["train/pl_mean_weight"] = float(pl_w_sum / max(pl_w_count, 1))
+        pl_vals["train/pl_weight_nz_ratio"] = float(int(getattr(self, "_pl_w_nz", 0)) / max(pl_w_count, 1))
+        pl_vals["train/pl_warmup"] = float(getattr(self, "_pl_warmup", 1.0))
+        pl_vals["train/da_warmup"] = float(getattr(self, "_da_warmup", 1.0))
         if hasattr(self, "_cls_conf_thres") and isinstance(self._cls_conf_thres, torch.Tensor):
             pl_vals["train/caps_thres_mean"] = float(self._cls_conf_thres.mean().detach().cpu())
         if hasattr(self, "_pl_conf_hist") and isinstance(self._pl_conf_hist, torch.Tensor):
@@ -584,12 +712,6 @@ class VersatileTeacherTrainer(DetectionTrainer):
                 self.train_loader.sampler.set_epoch(epoch)
                 self.train_loader_tgt.sampler.set_epoch(epoch)
 
-            # 然后决定是否调用instance_masks
-            if self.args.use_instance_masks:
-                _set_instance_masks(self.model, _build_instance_masks_from_labels(batch_src, strides))
-            else:
-                _set_instance_masks(self.model, None)
-
             # Phase transition: after phase-1, initialize student/teacher from phase-1 teacher (EMA) weights.
             if self.args.vt_phase1_epochs > 0 and epoch == self.args.vt_phase1_epochs:
                 with torch.no_grad():
@@ -610,6 +732,9 @@ class VersatileTeacherTrainer(DetectionTrainer):
             self._pl_total = 0
             self._pl_img_with = 0
             self._pl_img_total = 0
+            self._pl_w_sum = 0.0
+            self._pl_w_count = 0
+            self._pl_w_nz = 0
             self._pl_conf_sum = 0.0
             self._pl_conf_count = 0
             self._pl_conf_hist = torch.zeros((10,), device="cpu", dtype=torch.long)
@@ -659,7 +784,10 @@ class VersatileTeacherTrainer(DetectionTrainer):
 
                     # --- Source: supervised detection loss + domain losses
                     strides = unwrap_model(self.model).stride
-                    _set_instance_masks(self.model, _build_instance_masks_from_labels(batch_src, strides))
+                    if self.args.use_instance_masks:
+                        _set_instance_masks(self.model, _build_instance_masks_from_labels(batch_src, strides))
+                    else:
+                        _set_instance_masks(self.model, None)
                     loss_src, loss_items_src = self.model(batch_src)  # detection loss (sum over components)
 
                     img_logits_src, ins_logits_src = _get_vt_logits(self.model)
@@ -673,6 +801,9 @@ class VersatileTeacherTrainer(DetectionTrainer):
                     # Phase-1 (domain-aware pretraining): no pseudo labels, only domain losses.
                     # Phase-2 (teacher-student): teacher NMS pseudo labels + target detection loss.
                     phase1 = self.args.vt_phase1_epochs > 0 and epoch < self.args.vt_phase1_epochs
+                    phase2_step = epoch - int(self.args.vt_phase1_epochs) if not phase1 else 0
+                    self._pl_warmup = _linear_warmup(phase2_step, self.args.vt_pl_warmup_epochs) if not phase1 else 0.0
+                    self._da_warmup = _linear_warmup(phase2_step, self.args.vt_da_warmup_epochs) if not phase1 else 1.0
 
                     if phase1:
                         _set_instance_masks(self.model, None)
@@ -685,26 +816,48 @@ class VersatileTeacherTrainer(DetectionTrainer):
                         teacher.eval()
                         with torch.no_grad():
                             preds = teacher(img_tgt_weak)
-                            nms_out = non_max_suppression(
+                            nc = int(getattr(unwrap_model(self.model).model[-1], "nc", 0) or 0)
+                            # VT reproduction: CAPS uses density (hist argmax) + hard per-class threshold + 2nd NMS.
+                            # 1) NMS at a fixed low threshold (0.2) to estimate confidence density.
+                            nms_for_density = non_max_suppression(
                                 preds,
-                                conf_thres=self.args.vt_conf,
+                                conf_thres=0.2,
                                 iou_thres=self.args.vt_iou,
-                                max_det=300,
-                                nc=int(getattr(unwrap_model(self.model).model[-1], "nc", 0) or 0),
+                                max_det=1000,
+                                nc=nc,
                             )
-                            _, _, h, w = img_tgt_weak.shape
                             if self.args.vt_caps:
-                                # CAPS update + filter (Ultralytics NMS is global-threshold; CAPS is applied post-NMS)
                                 alpha_conf = 1.0 - cosine_decay.cal_alpha_conf(ni)
-                                conf_delta = _cal_density_from_nms(nms_out, nc=self._cls_conf_thres.numel(), device=self.device)
-                                low = conf_delta < 0.05
-                                conf_delta[low] = self._cls_conf_thres[low]
+                                conf_delta = _cal_density_from_nms(nms_for_density, nc=nc, device=self.device)
+                                # If density is ~0, keep old threshold (no objects in this batch for that class).
+                                missing = conf_delta < 0.05
+                                conf_delta[missing] = self._cls_conf_thres[missing]
                                 self._cls_conf_thres = self._cls_conf_thres * alpha_conf + conf_delta * (1.0 - alpha_conf)
-                                nms_out = _apply_caps_filter(nms_out, self._cls_conf_thres, device=self.device)
+                                # 2) Second-stage NMS with per-class confidence thresholds (hard filter).
+                                nms_out = _nms_per_class_conf_thres(
+                                    preds,
+                                    cls_conf_thres=self._cls_conf_thres,
+                                    iou_thres=self.args.vt_iou,
+                                    max_det=1000,
+                                    nc=nc,
+                                )
+                            else:
+                                # fallback: plain NMS
+                                nms_out = non_max_suppression(
+                                    preds,
+                                    conf_thres=self.args.vt_conf,
+                                    iou_thres=self.args.vt_iou,
+                                    max_det=1000,
+                                    nc=nc,
+                                )
+                            _, _, h, w = img_tgt_weak.shape
 
                             p_batch_idx, p_cls, p_bboxes, p_conf = _pseudo_labels_from_teacher_nms(
                                 nms_out, img_hw=(h, w), device=batch_tgt["img"].device
                             )
+                            # VT reproduction: hard CAPS uses unweighted pseudo-label loss (weight=1 for kept labels).
+                            w = torch.ones_like(p_conf) if p_conf.numel() else torch.zeros_like(p_conf)
+                            w_mean = float(w.mean().detach().cpu()) if w.numel() else 0.0
                             # Pseudo-label statistics for analysis
                             bsz = int(img_tgt_weak.shape[0])
                             self._pl_total += int(p_cls.shape[0])
@@ -716,6 +869,9 @@ class VersatileTeacherTrainer(DetectionTrainer):
                                 self._pl_conf_count += int(p_conf.numel())
                                 conf_bins = (p_conf.detach().flatten().cpu().clamp(0.0, 0.99) * 10.0).to(dtype=torch.long)
                                 self._pl_conf_hist += torch.bincount(conf_bins, minlength=10).to(dtype=torch.long)
+                                self._pl_w_sum += float(w.detach().sum().cpu())
+                                self._pl_w_count += int(w.numel())
+                                self._pl_w_nz += int((w.detach() > 0).sum().cpu())
                             if p_cls.numel():
                                 cls_ids = p_cls.detach().flatten().cpu().to(dtype=torch.long)
                                 self._pl_cls_hist += torch.bincount(cls_ids, minlength=self._pl_cls_hist.numel()).to(dtype=torch.long)
@@ -727,8 +883,13 @@ class VersatileTeacherTrainer(DetectionTrainer):
                         # strong: apply additional strong augmentation only on the student branch
                         pseudo_batch["img"] = self._strong_transform(img_tgt_weak) if self.args.vt_strong_enable else img_tgt_weak
 
-                        _set_instance_masks(self.model, _build_instance_masks_from_labels(pseudo_batch, strides))
+                        if self.args.use_instance_masks:
+                            _set_instance_masks(self.model, _build_instance_masks_from_labels(pseudo_batch, strides))
+                        else:
+                            _set_instance_masks(self.model, None)
                         loss_tgt, loss_items_tgt = self.model(pseudo_batch)
+                        # VT reproduction: hard CAPS -> no soft weighting. Optional warmup can still be enabled via cfg.
+                        loss_tgt = loss_tgt * float(self._pl_warmup)
 
                         img_logits_tgt, ins_logits_tgt = _get_vt_logits(self.model)
 
@@ -752,7 +913,8 @@ class VersatileTeacherTrainer(DetectionTrainer):
 
                     img_da = img_da_src + img_da_tgt
                     ins_da = ins_da_src + ins_da_tgt
-                    vt_da = self.args.vt_lambda_da * (img_da + ins_da) + self.args.vt_lambda_consensus * cons
+                    da_scale = float(self._da_warmup)
+                    vt_da = da_scale * (self.args.vt_lambda_da * (img_da + ins_da) + self.args.vt_lambda_consensus * cons)
 
                     loss = loss_src.sum() + (0.0 if phase1 else loss_tgt.sum()) + vt_da
                     loss_items = torch.cat(
