@@ -19,6 +19,10 @@ def main():
             "vt_caps_init": 0.8,
             "use_instance_masks": True,
             "vt_source_weak": False,
+            # A/B toggle for unified image-level domain classifier (UC-style).
+            "vt_use_unified": True,
+            # Optional attention alignment loss (0 disables).
+            "vt_lambda_attn": 0.1,
         }
     )
     trainer.train()

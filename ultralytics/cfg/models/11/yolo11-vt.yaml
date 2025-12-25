@@ -53,8 +53,9 @@ head:
   - [4, 1, VTImageDomainTap, [80, 0.1]] # 26 (backbone P3, 640/8=80)
   - [6, 1, VTImageDomainTap, [40, 0.1]] # 27 (backbone P4, 640/16=40)
   - [8, 1, VTImageDomainTap, [20, 0.1]] # 28 (backbone P5, 640/32=20)
-  - [16, 1, VTInstanceDomainTap, [0.1, True]] # 29
-  - [19, 1, VTInstanceDomainTap, [0.1, True]] # 30
-  - [22, 1, VTInstanceDomainTap, [0.1, True]] # 31
+  - [[4, 6, 8], 1, VTUnifiedImageDomainTap, [20, 0.1, 128]] # 29 (unified P5, 20x20)
+  - [16, 1, VTInstanceDomainTap, [0.1, True]] # 30
+  - [19, 1, VTInstanceDomainTap, [0.1, True]] # 31
+  - [22, 1, VTInstanceDomainTap, [0.1, True]] # 32
 
-  - [[16, 19, 22], 1, Detect, [nc]] # 32 Detect(P3, P4, P5)
+  - [[16, 19, 22], 1, Detect, [nc]] # 33 Detect(P3, P4, P5)
