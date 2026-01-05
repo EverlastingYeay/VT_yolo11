@@ -161,6 +161,7 @@ CFG_FLOAT_KEYS = frozenset(
         "batch",
         "vt_caps_gamma",
         "vt_pl_weight_cap",
+        "vt_loc_q_gamma",
     }
 )
 CFG_FRACTION_KEYS = frozenset(
@@ -194,6 +195,7 @@ CFG_FRACTION_KEYS = frozenset(
         "vt_iou",
         "vt_caps_q",
         "vt_caps_tau",
+        "vt_loc_q_thr",
     }
 )
 CFG_INT_KEYS = frozenset(
@@ -254,6 +256,8 @@ CFG_BOOL_KEYS = frozenset(
         "vt_val_per_class",
         "vt_auto_pretrained",
         "use_instance_masks",
+        "vt_loc_quality",
+        "vt_loc_q_weight",
     }
 )
 

@@ -124,14 +124,18 @@ vt_lambda_da: 0.1 # (float) domain adaptation loss weight
 vt_lambda_consensus: 0.1 # (float) image/instance consensus loss weight
 vt_conf: 0.2 # (float) confidence threshold for teacher pseudo-label NMS (VT uses 0.2 for CAPS density)
 vt_iou: 0.45 # (float) IoU threshold for teacher pseudo-label NMS
-vt_phase1_epochs: 0 # (int) phase-1 epochs (domain-aware pretraining, no pseudo-labels); 0 disables
-vt_source_weak: True # (bool) disable heavy YOLO augs on source (mosaic/mixup/copy-paste + strong HSV/geo)
+vt_phase1_epochs: 200 # (int) phase-1 epochs (domain-aware pretraining, no pseudo-labels); 0 disables
+vt_source_weak: false # (bool) disable heavy YOLO augs on source (mosaic/mixup/copy-paste + strong HSV/geo)
 vt_val_target: True # (bool) validate on target domain (GT only for evaluation)
 vt_val_per_class: True # (bool) print per-class metrics during training/validation
 vt_auto_pretrained: True # (bool) if model is YAML and pretrained=True, auto-init from local yolo11n.pt when available
 vt_caps_q: 0.9 # (float) CAPS per-class confidence quantile (precision-first: higher)
 vt_caps_gamma: 2.0 # (float) pseudo-label soft weight sharpness (w^gamma), higher -> more precision-focused
 vt_caps_tau: 0.05 # (float) soft-weight temperature for sigmoid((conf-thr)/tau); smaller -> more precision
+vt_loc_quality: true # (bool) enable localization-quality estimation for pseudo labels (entropy of DFL logits)
+vt_loc_q_thr: 0.0 # (float) min localization-quality threshold for pseudo-label filtering
+vt_loc_q_gamma: 1.0 # (float) localization-quality exponent for pseudo-label weighting
+vt_loc_q_weight: true # (bool) use localization-quality weights in pseudo-label loss
 vt_pl_warmup_epochs: 0 # (int) phase-2 pseudo-label loss warmup epochs (0 disables, VT default)
 vt_pl_weight_cap: 1.0 # (float) cap on pseudo-label batch mean weight after CAPS (0..1)
 vt_da_warmup_epochs: 0 # (int) phase-2 DA loss warmup epochs (0 disables)

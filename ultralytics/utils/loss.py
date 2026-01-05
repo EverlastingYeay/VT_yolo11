@@ -261,13 +261,26 @@ class v8DetectionLoss:
         targets = self.preprocess(targets, batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
         gt_labels, gt_bboxes = targets.split((1, 4), 2)  # cls, xyxy
         mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
+        gt_weights = None
+        if "weights" in batch:
+            batch_idx = batch["batch_idx"].view(-1)
+            weights = batch["weights"].view(-1)
+            if weights.numel() == batch_idx.numel():
+                _, counts = batch_idx.unique(return_counts=True)
+                max_count = int(counts.max().item()) if counts.numel() else 0
+                if max_count > 0:
+                    gt_weights = torch.zeros((batch_size, max_count), device=self.device, dtype=pred_scores.dtype)
+                    for j in range(batch_size):
+                        matches = batch_idx == j
+                        if n := matches.sum():
+                            gt_weights[j, :n] = weights[matches].to(dtype=pred_scores.dtype)
 
         # Pboxes
         pred_bboxes = self.bbox_decode(anchor_points, pred_distri)  # xyxy, (b, h*w, 4)
         # dfl_conf = pred_distri.view(batch_size, -1, 4, self.reg_max).detach().softmax(-1)
         # dfl_conf = (dfl_conf.amax(-1).mean(-1) + dfl_conf.amax(-1).amin(-1)) / 2
 
-        _, target_bboxes, target_scores, fg_mask, _ = self.assigner(
+        _, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
             # pred_scores.detach().sigmoid() * 0.8 + dfl_conf.unsqueeze(-1) * 0.2,
             pred_scores.detach().sigmoid(),
             (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
@@ -276,6 +289,10 @@ class v8DetectionLoss:
             gt_bboxes,
             mask_gt,
         )
+
+        if gt_weights is not None and gt_weights.shape[1] > 0:
+            gt_weights = gt_weights.gather(1, target_gt_idx.clamp(min=0))
+            target_scores = target_scores * gt_weights.unsqueeze(-1)
 
         target_scores_sum = max(target_scores.sum(), 1)
 

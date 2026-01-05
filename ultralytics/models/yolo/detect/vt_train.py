@@ -70,6 +70,28 @@ def _clear_vt_cache(model: nn.Module):
             m.set_mask(None)
 
 
+def _loc_quality_from_raw(raw_feats: list[torch.Tensor] | None, reg_max: int) -> torch.Tensor | None:
+    """Estimate per-anchor localization quality from raw DFL logits (entropy-based)."""
+    if not raw_feats or reg_max <= 1:
+        return None
+    box_chunks = []
+    for feat in raw_feats:
+        if feat is None or feat.numel() == 0:
+            continue
+        bsz = feat.shape[0]
+        box = feat[:, : reg_max * 4, ...].view(bsz, reg_max * 4, -1)
+        box_chunks.append(box)
+    if not box_chunks:
+        return None
+    box = torch.cat(box_chunks, 2)  # (B, 4*reg_max, N)
+    bsz = box.shape[0]
+    box = box.view(bsz, 4, reg_max, -1)
+    probs = F.softmax(box, dim=2)
+    entropy = -(probs * (probs + 1e-9).log()).sum(dim=2) / math.log(reg_max)
+    loc_q = 1.0 - entropy.mean(dim=1)
+    return loc_q.clamp_(0.0, 1.0)
+
+
 def _build_instance_masks_from_labels(
     batch: dict[str, torch.Tensor],
     strides: torch.Tensor,
@@ -140,26 +162,29 @@ def _pseudo_labels_from_teacher_nms(
     nms_out: list[torch.Tensor],
     img_hw: tuple[int, int],
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build (batch_idx, cls, bboxes, conf) tensors from Ultralytics NMS output."""
     img_h, img_w = img_hw
     batch_idx_list: list[torch.Tensor] = []
     cls_list: list[torch.Tensor] = []
     bboxes_list: list[torch.Tensor] = []
     conf_list: list[torch.Tensor] = []
+    locq_list: list[torch.Tensor] = []
     for i, det in enumerate(nms_out):
         if det is None or det.numel() == 0:
             continue
-        # det: (N,6+extra) -> xyxy, conf, cls
-        det = det[:, :6]
-        xyxy = det[:, 0:4]
-        conf = det[:, 4:5]
-        cls = det[:, 5:6]
+        # det: (N,6+extra) -> xyxy, conf, cls, extra...
+        det6 = det[:, :6]
+        xyxy = det6[:, 0:4]
+        conf = det6[:, 4:5]
+        cls = det6[:, 5:6]
+        locq = det[:, -1:] if det.shape[1] > 6 else torch.ones_like(conf)
         bboxes = xyxy2xywhn(xyxy, w=img_w, h=img_h, clip=True)  # normalized xywh
         batch_idx_list.append(torch.full((det.shape[0],), i, device=device, dtype=torch.int64))
         cls_list.append(cls.to(device=device, dtype=torch.float32))
         bboxes_list.append(bboxes.to(device=device, dtype=torch.float32))
         conf_list.append(conf.to(device=device, dtype=torch.float32))
+        locq_list.append(locq.to(device=device, dtype=torch.float32))
 
     if not batch_idx_list:
         return (
@@ -167,24 +192,36 @@ def _pseudo_labels_from_teacher_nms(
             torch.zeros((0, 1), device=device, dtype=torch.float32),
             torch.zeros((0, 4), device=device, dtype=torch.float32),
             torch.zeros((0, 1), device=device, dtype=torch.float32),
+            torch.zeros((0, 1), device=device, dtype=torch.float32),
         )
 
-    return torch.cat(batch_idx_list, 0), torch.cat(cls_list, 0), torch.cat(bboxes_list, 0), torch.cat(conf_list, 0)
+    return (
+        torch.cat(batch_idx_list, 0),
+        torch.cat(cls_list, 0),
+        torch.cat(bboxes_list, 0),
+        torch.cat(conf_list, 0),
+        torch.cat(locq_list, 0),
+    )
 
 
-def _cal_density_from_nms(nms_out: list[torch.Tensor], nc: int, device: torch.device) -> torch.Tensor:
-    """Compute per-class confidence density proxy from NMS output.
+def _cal_density_from_nms(
+    nms_out: list[torch.Tensor], nc: int, device: torch.device, use_locq: bool = False, locq_gamma: float = 1.0
+) -> torch.Tensor:
+    """Compute per-class score density proxy from NMS output.
 
-    This follows the VersatileTeacher implementation idea: for each class we build a 10-bin histogram over confidences
-    and take the bin with maximum count as the class confidence "density" value.
+    This follows the VersatileTeacher implementation idea: for each class we build a 10-bin histogram over scores and
+    take the bin with maximum count as the class confidence "density" value.
     """
     density = torch.zeros((nc, 10), device=device)
     for det in nms_out:
         if det is None or det.numel() == 0:
             continue
-        det = det[:, :6]  # xyxy, conf, cls
-        conf = det[:, 4].clamp(max=0.99)
-        cls = det[:, 5].to(dtype=torch.long)
+        det6 = det[:, :6]  # xyxy, conf, cls
+        conf = det6[:, 4].clamp(max=0.99)
+        if use_locq and det.shape[1] > 6:
+            locq = det[:, -1].clamp(0.0, 1.0)
+            conf = conf * (locq**float(locq_gamma))
+        cls = det6[:, 5].to(dtype=torch.long)
         bins = (conf * 10).to(dtype=torch.long).clamp(0, 9)
         for c, b in zip(cls.tolist(), bins.tolist()):
             density[c, b] += 1
@@ -460,6 +497,10 @@ class VersatileTeacherTrainer(DetectionTrainer):
         self.args.vt_caps_q = float(getattr(self.args, "vt_caps_q", 0.9))
         self.args.vt_caps_gamma = float(getattr(self.args, "vt_caps_gamma", 2.0))
         self.args.vt_caps_tau = float(getattr(self.args, "vt_caps_tau", 0.05))
+        self.args.vt_loc_quality = bool(getattr(self.args, "vt_loc_quality", True))
+        self.args.vt_loc_q_thr = float(getattr(self.args, "vt_loc_q_thr", 0.0))
+        self.args.vt_loc_q_gamma = float(getattr(self.args, "vt_loc_q_gamma", 1.0))
+        self.args.vt_loc_q_weight = bool(getattr(self.args, "vt_loc_q_weight", True))
         self.args.vt_pl_warmup_epochs = int(getattr(self.args, "vt_pl_warmup_epochs", 0))
         self.args.vt_pl_weight_cap = float(getattr(self.args, "vt_pl_weight_cap", 1.0))
         self.args.vt_da_warmup_epochs = int(getattr(self.args, "vt_da_warmup_epochs", 0))
@@ -607,6 +648,9 @@ class VersatileTeacherTrainer(DetectionTrainer):
         pl_conf_count = int(getattr(self, "_pl_conf_count", 0))
         pl_conf_sum = float(getattr(self, "_pl_conf_sum", 0.0))
         pl_vals["train/pl_mean_conf"] = float(pl_conf_sum / max(pl_conf_count, 1))
+        pl_locq_count = int(getattr(self, "_pl_locq_count", 0))
+        pl_locq_sum = float(getattr(self, "_pl_locq_sum", 0.0))
+        pl_vals["train/pl_mean_locq"] = float(pl_locq_sum / max(pl_locq_count, 1))
         pl_w_count = int(getattr(self, "_pl_w_count", 0))
         pl_w_sum = float(getattr(self, "_pl_w_sum", 0.0))
         pl_vals["train/pl_mean_weight"] = float(pl_w_sum / max(pl_w_count, 1))
@@ -618,6 +662,9 @@ class VersatileTeacherTrainer(DetectionTrainer):
         if hasattr(self, "_pl_conf_hist") and isinstance(self._pl_conf_hist, torch.Tensor):
             for bi, v in enumerate(self._pl_conf_hist.detach().cpu().to(dtype=torch.long).tolist()):
                 pl_vals[f"train/pl_conf_hist/{bi}"] = int(v)
+        if hasattr(self, "_pl_locq_hist") and isinstance(self._pl_locq_hist, torch.Tensor):
+            for bi, v in enumerate(self._pl_locq_hist.detach().cpu().to(dtype=torch.long).tolist()):
+                pl_vals[f"train/pl_locq_hist/{bi}"] = int(v)
         if hasattr(self, "_pl_cls_hist") and isinstance(self._pl_cls_hist, torch.Tensor):
             cls_hist = self._pl_cls_hist.detach().cpu().to(dtype=torch.long).tolist()
             names = getattr(self, "_pl_cls_names", None)
@@ -628,10 +675,27 @@ class VersatileTeacherTrainer(DetectionTrainer):
                 else:
                     pl_vals[f"train/pl_cls_hist/{ci}"] = int(v)
 
+        # Link loc-quality with mAP and losses for quick correlation plots.
+        link_vals = {}
+        pl_locq = pl_vals.get("train/pl_mean_locq", None)
+        if pl_locq is not None:
+            map50 = val_vals.get("val_tgt/mAP50(B)", None)
+            map5095 = val_vals.get("val_tgt/mAP50-95(B)", None)
+            if map50 is not None:
+                link_vals["train/link_pl_locq_x_map50"] = float(pl_locq) * float(map50)
+            if map5095 is not None:
+                link_vals["train/link_pl_locq_x_map5095"] = float(pl_locq) * float(map5095)
+            box_loss = train_vals.get("train/box_loss", None)
+            dfl_loss = train_vals.get("train/dfl_loss", None)
+            if box_loss is not None:
+                link_vals["train/link_pl_locq_over_box_loss"] = float(pl_locq) / max(float(box_loss), 1e-9)
+            if dfl_loss is not None:
+                link_vals["train/link_pl_locq_over_dfl_loss"] = float(pl_locq) / max(float(dfl_loss), 1e-9)
+
         # Learning rates
         lr_vals = {f"lr/pg{i}": float(x["lr"]) for i, x in enumerate(self.optimizer.param_groups)}
 
-        self.save_metrics(metrics={**train_vals, **val_vals, **pl_vals, **lr_vals})
+        self.save_metrics(metrics={**train_vals, **val_vals, **pl_vals, **link_vals, **lr_vals})
 
     def validate(self):
         """Validate on target domain by default (GT only for evaluation)."""
@@ -738,6 +802,9 @@ class VersatileTeacherTrainer(DetectionTrainer):
             self._pl_conf_sum = 0.0
             self._pl_conf_count = 0
             self._pl_conf_hist = torch.zeros((10,), device="cpu", dtype=torch.long)
+            self._pl_locq_sum = 0.0
+            self._pl_locq_count = 0
+            self._pl_locq_hist = torch.zeros((10,), device="cpu", dtype=torch.long)
             nc = int(getattr(unwrap_model(self.model).model[-1], "nc", 0) or 0)
             self._pl_cls_hist = torch.zeros((nc,), device="cpu", dtype=torch.long)
             for i in pbar:
@@ -816,8 +883,17 @@ class VersatileTeacherTrainer(DetectionTrainer):
                         teacher.eval()
                         with torch.no_grad():
                             preds = teacher(img_tgt_weak)
+                            raw_feats = None
+                            if isinstance(preds, (list, tuple)):
+                                raw_feats = preds[1] if len(preds) > 1 else None
+                                preds = preds[0]
                             nc = int(getattr(unwrap_model(self.model).model[-1], "nc", 0) or 0)
-                            # VT reproduction: CAPS uses density (hist argmax) + hard per-class threshold + 2nd NMS.
+                            if self.args.vt_loc_quality:
+                                reg_max = int(getattr(unwrap_model(self.model).model[-1], "reg_max", 0) or 0)
+                                loc_q = _loc_quality_from_raw(raw_feats, reg_max)
+                                if loc_q is not None:
+                                    preds = torch.cat((preds, loc_q.unsqueeze(1)), 1)
+                            # VT CAPS: use density (hist argmax) on combined score, then apply soft weights post-NMS.
                             # 1) NMS at a fixed low threshold (0.2) to estimate confidence density.
                             nms_for_density = non_max_suppression(
                                 preds,
@@ -828,35 +904,59 @@ class VersatileTeacherTrainer(DetectionTrainer):
                             )
                             if self.args.vt_caps:
                                 alpha_conf = 1.0 - cosine_decay.cal_alpha_conf(ni)
-                                conf_delta = _cal_density_from_nms(nms_for_density, nc=nc, device=self.device)
+                                conf_delta = _cal_density_from_nms(
+                                    nms_for_density,
+                                    nc=nc,
+                                    device=self.device,
+                                    use_locq=self.args.vt_loc_quality,
+                                    locq_gamma=self.args.vt_loc_q_gamma,
+                                )
                                 # If density is ~0, keep old threshold (no objects in this batch for that class).
                                 missing = conf_delta < 0.05
                                 conf_delta[missing] = self._cls_conf_thres[missing]
                                 self._cls_conf_thres = self._cls_conf_thres * alpha_conf + conf_delta * (1.0 - alpha_conf)
-                                # 2) Second-stage NMS with per-class confidence thresholds (hard filter).
-                                nms_out = _nms_per_class_conf_thres(
-                                    preds,
-                                    cls_conf_thres=self._cls_conf_thres,
-                                    iou_thres=self.args.vt_iou,
-                                    max_det=1000,
-                                    nc=nc,
-                                )
-                            else:
-                                # fallback: plain NMS
-                                nms_out = non_max_suppression(
-                                    preds,
-                                    conf_thres=self.args.vt_conf,
-                                    iou_thres=self.args.vt_iou,
-                                    max_det=1000,
-                                    nc=nc,
-                                )
+                            # 2) Plain NMS; CAPS now uses combined score + soft weights post-NMS.
+                            nms_out = non_max_suppression(
+                                preds,
+                                conf_thres=self.args.vt_conf,
+                                iou_thres=self.args.vt_iou,
+                                max_det=1000,
+                                nc=nc,
+                            )
                             _, _, h, w = img_tgt_weak.shape
 
-                            p_batch_idx, p_cls, p_bboxes, p_conf = _pseudo_labels_from_teacher_nms(
+                            p_batch_idx, p_cls, p_bboxes, p_conf, p_locq = _pseudo_labels_from_teacher_nms(
                                 nms_out, img_hw=(h, w), device=batch_tgt["img"].device
                             )
-                            # VT reproduction: hard CAPS uses unweighted pseudo-label loss (weight=1 for kept labels).
-                            w = torch.ones_like(p_conf) if p_conf.numel() else torch.zeros_like(p_conf)
+                            if self.args.vt_loc_quality:
+                                p_locq = p_locq.clamp(0.0, 1.0) if p_locq.numel() else torch.zeros_like(p_conf)
+                                if self.args.vt_loc_q_thr > 0 and p_locq.numel():
+                                    keep = p_locq.view(-1) >= float(self.args.vt_loc_q_thr)
+                                    p_batch_idx = p_batch_idx[keep]
+                                    p_cls = p_cls[keep]
+                                    p_bboxes = p_bboxes[keep]
+                                    p_conf = p_conf[keep]
+                                    p_locq = p_locq[keep]
+                                combined = p_conf * (p_locq ** float(self.args.vt_loc_q_gamma)) if p_conf.numel() else p_conf
+                            else:
+                                p_locq = torch.ones_like(p_conf) if p_conf.numel() else torch.zeros_like(p_conf)
+                                combined = p_conf
+                            if self.args.vt_caps:
+                                if p_cls.numel():
+                                    cls_ids = p_cls.view(-1).to(dtype=torch.long)
+                                    cls_thr = self._cls_conf_thres.to(device=combined.device)[cls_ids].view(-1, 1)
+                                    tau = max(float(self.args.vt_caps_tau), 1e-6)
+                                    w_caps = torch.sigmoid((combined - cls_thr) / tau)
+                                    w_caps = w_caps.pow(float(self.args.vt_caps_gamma))
+                                else:
+                                    w_caps = torch.zeros_like(combined)
+                            else:
+                                w_caps = torch.ones_like(combined)
+                            use_weights = self.args.vt_caps or self.args.vt_loc_quality
+                            if use_weights:
+                                w = combined * w_caps if self.args.vt_loc_q_weight else w_caps
+                            else:
+                                w = torch.ones_like(p_conf) if p_conf.numel() else torch.zeros_like(p_conf)
                             w_mean = float(w.mean().detach().cpu()) if w.numel() else 0.0
                             # Pseudo-label statistics for analysis
                             bsz = int(img_tgt_weak.shape[0])
@@ -872,6 +972,11 @@ class VersatileTeacherTrainer(DetectionTrainer):
                                 self._pl_w_sum += float(w.detach().sum().cpu())
                                 self._pl_w_count += int(w.numel())
                                 self._pl_w_nz += int((w.detach() > 0).sum().cpu())
+                            if p_locq.numel():
+                                self._pl_locq_sum += float(p_locq.detach().sum().cpu())
+                                self._pl_locq_count += int(p_locq.numel())
+                                locq_bins = (p_locq.detach().flatten().cpu().clamp(0.0, 0.99) * 10.0).to(dtype=torch.long)
+                                self._pl_locq_hist += torch.bincount(locq_bins, minlength=10).to(dtype=torch.long)
                             if p_cls.numel():
                                 cls_ids = p_cls.detach().flatten().cpu().to(dtype=torch.long)
                                 self._pl_cls_hist += torch.bincount(cls_ids, minlength=self._pl_cls_hist.numel()).to(dtype=torch.long)
@@ -880,6 +985,8 @@ class VersatileTeacherTrainer(DetectionTrainer):
                         pseudo_batch["batch_idx"] = p_batch_idx
                         pseudo_batch["cls"] = p_cls
                         pseudo_batch["bboxes"] = p_bboxes
+                        if (self.args.vt_caps or self.args.vt_loc_quality) and w.numel():
+                            pseudo_batch["weights"] = w
                         # strong: apply additional strong augmentation only on the student branch
                         pseudo_batch["img"] = self._strong_transform(img_tgt_weak) if self.args.vt_strong_enable else img_tgt_weak
 
