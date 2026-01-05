@@ -70,6 +70,7 @@ from ultralytics.nn.modules import (
     YOLOESegment,
     VTImageDomainTap,
     VTInstanceDomainTap,
+    VTUnifiedImageDomainTap,
     v10Detect,
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, LOGGER, YAML, colorstr, emojis
@@ -1621,7 +1622,10 @@ def parse_model(d, ch, verbose=True):
             c2 = ch[f]
         elif m in frozenset({VTImageDomainTap, VTInstanceDomainTap}):
             args = [ch[f], *args]
-            c2 = ch[f]
+        elif m is VTUnifiedImageDomainTap:
+            in_ch = [ch[x] for x in f] if isinstance(f, list) else [ch[f]]
+            args = [in_ch, *args]
+            c2 = in_ch[-1]
         elif m in frozenset({HGStem, HGBlock}):
             c1, cm, c2 = ch[f], args[0], args[1]
             args = [c1, cm, c2, *args[2:]]

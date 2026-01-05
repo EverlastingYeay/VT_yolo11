@@ -16,7 +16,7 @@ import torch.nn.functional as F
 import torchvision.transforms as transforms
 
 from ultralytics.data import build_dataloader, build_yolo_dataset
-from ultralytics.nn.modules.vt import VTImageDomainTap, VTInstanceDomainTap
+from ultralytics.nn.modules.vt import VTImageDomainTap, VTInstanceDomainTap, VTUnifiedImageDomainTap
 from ultralytics.utils import LOGGER, LOCAL_RANK, RANK, TQDM
 from ultralytics.utils.nms import non_max_suppression
 from ultralytics.utils.ops import xywh2xyxy, xyxy2xywhn
@@ -30,7 +30,7 @@ def _iter_domain_modules(model: nn.Module):
     # unwrap DDP to access actual module types
     model = unwrap_model(model)
     for m in model.modules():
-        if isinstance(m, (VTImageDomainTap, VTInstanceDomainTap)):
+        if isinstance(m, (VTImageDomainTap, VTInstanceDomainTap, VTUnifiedImageDomainTap)):
             yield m
 
 
@@ -38,7 +38,7 @@ def _get_vt_logits(model: nn.Module) -> tuple[list[torch.Tensor], list[torch.Ten
     """Collect stored logits from VT taps after a forward pass."""
     image_logits, instance_logits = [], []
     for m in _iter_domain_modules(model):
-        if isinstance(m, VTImageDomainTap) and m.last_logits is not None:
+        if isinstance(m, (VTImageDomainTap, VTUnifiedImageDomainTap)) and m.last_logits is not None:
             lg = m.last_logits
             # Defensive: image logits should be (B, 2) for CrossEntropyLoss.
             if lg.ndim == 1:
@@ -47,6 +47,50 @@ def _get_vt_logits(model: nn.Module) -> tuple[list[torch.Tensor], list[torch.Ten
         elif isinstance(m, VTInstanceDomainTap) and m.last_logits is not None:
             instance_logits.append(m.last_logits)
     return image_logits, instance_logits
+
+
+def _get_vt_attn_maps(model: nn.Module) -> list[torch.Tensor]:
+    """Collect stored attention maps from VT image taps after a forward pass."""
+    attn_maps = []
+    for m in _iter_domain_modules(model):
+        if isinstance(m, (VTImageDomainTap, VTUnifiedImageDomainTap)) and getattr(m, "last_attn", None) is not None:
+            am = m.last_attn
+            if am.ndim == 2:
+                am = am.unsqueeze(0).unsqueeze(0)
+            elif am.ndim == 3:
+                am = am.unsqueeze(1)
+            attn_maps.append(am)
+    return attn_maps
+
+
+def _attn_align_loss(src_maps: list[torch.Tensor], tgt_maps: list[torch.Tensor]) -> torch.Tensor:
+    """Attention alignment loss between source/target attention maps (per-scale)."""
+    device = None
+    if src_maps:
+        device = src_maps[0].device
+    elif tgt_maps:
+        device = tgt_maps[0].device
+    if not src_maps or not tgt_maps:
+        return torch.zeros((), device=device)
+
+    def _norm(x: torch.Tensor) -> torch.Tensor:
+        x = x.float()
+        x = x - x.mean(dim=(2, 3), keepdim=True)
+        x = x / (x.std(dim=(2, 3), keepdim=True) + 1e-6)
+        return x.sigmoid()
+
+    loss = torch.zeros((), device=device)
+    for s, t in zip(src_maps, tgt_maps):
+        b = min(s.shape[0], t.shape[0])
+        if b <= 0:
+            continue
+        s = _norm(s[:b])
+        t = _norm(t[:b])
+        # Align mean attention maps to avoid one-to-one pairing assumptions.
+        s = s.mean(dim=0, keepdim=True)
+        t = t.mean(dim=0, keepdim=True)
+        loss = loss + F.l1_loss(s, t)
+    return loss
 
 
 def _set_instance_masks(model: nn.Module, masks: list[torch.Tensor] | None):
@@ -61,11 +105,20 @@ def _set_instance_masks(model: nn.Module, masks: list[torch.Tensor] | None):
     for t, mask in zip(taps, masks):
         t.set_mask(mask)
 
+
+def _set_unified_enabled(model: nn.Module, enabled: bool):
+    """Enable/disable unified image-level domain tap to support A/B comparisons."""
+    for m in _iter_domain_modules(model):
+        if isinstance(m, VTUnifiedImageDomainTap):
+            m.enabled = bool(enabled)
+
 def _clear_vt_cache(model: nn.Module):
     """Clear cached tensors on VT tap modules to keep EMA deepcopy safe."""
     for m in _iter_domain_modules(model):
         if hasattr(m, "last_logits"):
             m.last_logits = None
+        if hasattr(m, "last_attn"):
+            m.last_attn = None
         if hasattr(m, "set_mask"):
             m.set_mask(None)
 
@@ -504,6 +557,8 @@ class VersatileTeacherTrainer(DetectionTrainer):
         self.args.vt_pl_warmup_epochs = int(getattr(self.args, "vt_pl_warmup_epochs", 0))
         self.args.vt_pl_weight_cap = float(getattr(self.args, "vt_pl_weight_cap", 1.0))
         self.args.vt_da_warmup_epochs = int(getattr(self.args, "vt_da_warmup_epochs", 0))
+        self.args.vt_lambda_attn = float(getattr(self.args, "vt_lambda_attn", 0.0))
+        self.args.vt_use_unified = bool(getattr(self.args, "vt_use_unified", False))
         self.args.vt_strong_enable = bool(getattr(self.args, "vt_strong_enable", True))
         self.args.vt_strong_brightness = float(getattr(self.args, "vt_strong_brightness", 0.5))
         self.args.vt_strong_contrast = float(getattr(self.args, "vt_strong_contrast", 0.5))
@@ -511,10 +566,11 @@ class VersatileTeacherTrainer(DetectionTrainer):
         self.args.vt_strong_hue = float(getattr(self.args, "vt_strong_hue", 0.5))
         self.args.vt_strong_blur_kernel = int(getattr(self.args, "vt_strong_blur_kernel", 5))
         self.args.vt_strong_erasing_p = float(getattr(self.args, "vt_strong_erasing_p", 0.5))
+        _set_unified_enabled(self.model, self.args.vt_use_unified)
 
         self._ce = nn.CrossEntropyLoss()
         self._bce = nn.BCEWithLogitsLoss()
-        self.loss_names = ("box_loss", "cls_loss", "dfl_loss", "img_da", "ins_da", "cons")
+        self.loss_names = ("box_loss", "cls_loss", "dfl_loss", "img_da", "ins_da", "cons", "attn_align")
 
         # Strong augmentation for target student branch (configurable via YAML).
         strong_ops: list[nn.Module] = []
@@ -858,6 +914,7 @@ class VersatileTeacherTrainer(DetectionTrainer):
                     loss_src, loss_items_src = self.model(batch_src)  # detection loss (sum over components)
 
                     img_logits_src, ins_logits_src = _get_vt_logits(self.model)
+                    img_attn_src = _get_vt_attn_maps(self.model)
                     domain_src = torch.zeros((1,), device=self.device, dtype=torch.long)
                     img_da_src = sum(self._ce(lg, domain_src.expand(lg.shape[0])) for lg in img_logits_src) if img_logits_src else 0.0
                     ins_da_src = (
@@ -878,6 +935,7 @@ class VersatileTeacherTrainer(DetectionTrainer):
                         loss_tgt = torch.zeros_like(loss_src)
                         loss_items_tgt = torch.zeros_like(loss_items_src)
                         img_logits_tgt, ins_logits_tgt = _get_vt_logits(self.model)
+                        img_attn_tgt = _get_vt_attn_maps(self.model)
                     else:
                         teacher = self.ema.ema
                         teacher.eval()
@@ -999,6 +1057,7 @@ class VersatileTeacherTrainer(DetectionTrainer):
                         loss_tgt = loss_tgt * float(self._pl_warmup)
 
                         img_logits_tgt, ins_logits_tgt = _get_vt_logits(self.model)
+                        img_attn_tgt = _get_vt_attn_maps(self.model)
 
                     domain_tgt = torch.ones((1,), device=self.device, dtype=torch.long)
                     img_da_tgt = sum(self._ce(lg, domain_tgt.expand(lg.shape[0])) for lg in img_logits_tgt) if img_logits_tgt else 0.0
@@ -1020,15 +1079,25 @@ class VersatileTeacherTrainer(DetectionTrainer):
 
                     img_da = img_da_src + img_da_tgt
                     ins_da = ins_da_src + ins_da_tgt
+                    attn_align = _attn_align_loss(img_attn_src, img_attn_tgt).to(self.device)
                     da_scale = float(self._da_warmup)
-                    vt_da = da_scale * (self.args.vt_lambda_da * (img_da + ins_da) + self.args.vt_lambda_consensus * cons)
+                    vt_da = da_scale * (
+                        self.args.vt_lambda_da * (img_da + ins_da)
+                        + self.args.vt_lambda_consensus * cons
+                        + self.args.vt_lambda_attn * attn_align
+                    )
 
                     loss = loss_src.sum() + (0.0 if phase1 else loss_tgt.sum()) + vt_da
                     loss_items = torch.cat(
                         (
                             loss_items_src.detach(),
                             torch.tensor(
-                                [float(img_da.detach()), float(ins_da.detach()), float(cons.detach())],
+                                [
+                                    float(img_da.detach()),
+                                    float(ins_da.detach()),
+                                    float(cons.detach()),
+                                    float(attn_align.detach()),
+                                ],
                                 device=self.device,
                                 dtype=loss_items_src.dtype,
                             ),
