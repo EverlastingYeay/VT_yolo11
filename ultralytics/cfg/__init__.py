@@ -162,6 +162,11 @@ CFG_FLOAT_KEYS = frozenset(
         "vt_caps_gamma",
         "vt_pl_weight_cap",
         "vt_loc_q_gamma",
+        "vt_cons_iou_gamma",
+        "vt_cons_iou_alpha",
+        "vt_caps_gamma_final",
+        "vt_loc_q_gamma_final",
+        "vt_cls_delta",
     }
 )
 CFG_FRACTION_KEYS = frozenset(
@@ -193,9 +198,18 @@ CFG_FRACTION_KEYS = frozenset(
         "vt_lambda_consensus",
         "vt_conf",
         "vt_iou",
+        "vt_conf_floor",
         "vt_caps_q",
         "vt_caps_tau",
         "vt_loc_q_thr",
+        "vt_cons_iou_thr",
+        "vt_quality_min",
+        "vt_caps_init_final",
+        "vt_caps_tau_final",
+        "vt_loc_q_thr_final",
+        "vt_cls_thres_min",
+        "vt_cls_thres_max",
+        "vt_cls_tau",
     }
 )
 CFG_INT_KEYS = frozenset(
@@ -214,6 +228,8 @@ CFG_INT_KEYS = frozenset(
         "vt_phase1_epochs",
         "vt_pl_warmup_epochs",
         "vt_da_warmup_epochs",
+        "vt_sched_epochs",
+        "vt_pl_min_per_img",
     }
 )
 CFG_BOOL_KEYS = frozenset(
@@ -258,6 +274,8 @@ CFG_BOOL_KEYS = frozenset(
         "use_instance_masks",
         "vt_loc_quality",
         "vt_loc_q_weight",
+        "vt_cons_iou",
+        "vt_cls_curriculum",
     }
 )
 

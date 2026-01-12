@@ -133,10 +133,28 @@ vt_auto_pretrained: True # (bool) if model is YAML and pretrained=True, auto-ini
 vt_caps_q: 0.9 # (float) CAPS per-class confidence quantile (precision-first: higher)
 vt_caps_gamma: 2.0 # (float) pseudo-label soft weight sharpness (w^gamma), higher -> more precision-focused
 vt_caps_tau: 0.05 # (float) soft-weight temperature for sigmoid((conf-thr)/tau); smaller -> more precision
+vt_sched_epochs: 0 # (int) phase-2 epochs to linearly schedule CAPS/loc-quality thresholds (0 disables)
+vt_caps_init_final: 0.8 # (float) final CAPS threshold after scheduling
+vt_caps_gamma_final: 2.0 # (float) final CAPS gamma after scheduling
+vt_caps_tau_final: 0.05 # (float) final CAPS tau after scheduling
+vt_cls_curriculum: false # (bool) enable per-class threshold curriculum updates
+vt_cls_thres_min: 0.2 # (float) per-class threshold lower bound
+vt_cls_thres_max: 0.8 # (float) per-class threshold upper bound (decays to min if sched enabled)
+vt_cls_delta: 0.02 # (float) per-class threshold step per update
+vt_cls_tau: 0.1 # (float) class density threshold for updating per-class thresholds
 vt_loc_quality: true # (bool) enable localization-quality estimation for pseudo labels (entropy of DFL logits)
 vt_loc_q_thr: 0.0 # (float) min localization-quality threshold for pseudo-label filtering
 vt_loc_q_gamma: 1.0 # (float) localization-quality exponent for pseudo-label weighting
+vt_loc_q_thr_final: 0.0 # (float) final loc-quality threshold after scheduling
+vt_loc_q_gamma_final: 1.0 # (float) final loc-quality gamma after scheduling
 vt_loc_q_weight: true # (bool) use localization-quality weights in pseudo-label loss
+vt_cons_iou: false # (bool) enable teacher-student consistency IoU for pseudo-label quality
+vt_cons_iou_thr: 0.0 # (float) min consistency IoU threshold for pseudo-label filtering
+vt_cons_iou_gamma: 1.0 # (float) consistency IoU exponent for pseudo-label weighting
+vt_cons_iou_alpha: 0.5 # (float) blend weight for consistency IoU in quality fusion (0=locq only, 1=cons_iou only)
+vt_quality_min: 0.1 # (float) floor for fused quality to avoid weight collapse
+vt_conf_floor: 0.05 # (float) fallback NMS confidence for min pseudo-labels per image
+vt_pl_min_per_img: 0 # (int) ensure at least N pseudo-labels per image (0 disables)
 vt_pl_warmup_epochs: 0 # (int) phase-2 pseudo-label loss warmup epochs (0 disables, VT default)
 vt_pl_weight_cap: 1.0 # (float) cap on pseudo-label batch mean weight after CAPS (0..1)
 vt_da_warmup_epochs: 0 # (int) phase-2 DA loss warmup epochs (0 disables)
