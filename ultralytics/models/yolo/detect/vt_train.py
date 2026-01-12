@@ -20,6 +20,7 @@ from ultralytics.nn.modules.vt import VTImageDomainTap, VTInstanceDomainTap
 from ultralytics.utils import LOGGER, LOCAL_RANK, RANK, TQDM
 from ultralytics.utils.nms import non_max_suppression
 from ultralytics.utils.ops import xywh2xyxy, xyxy2xywhn
+from ultralytics.utils.metrics import box_iou
 from ultralytics.utils.torch_utils import autocast, unwrap_model
 
 from .train import DetectionTrainer
@@ -170,6 +171,148 @@ def _pseudo_labels_from_teacher_nms(
         )
 
     return torch.cat(batch_idx_list, 0), torch.cat(cls_list, 0), torch.cat(bboxes_list, 0), torch.cat(conf_list, 0)
+
+
+def _apply_light_color_jitter(
+    img: torch.Tensor,
+    brightness: float = 0.0,
+    contrast: float = 0.0,
+    saturation: float = 0.0,
+) -> torch.Tensor:
+    """Apply lightweight color jitter (batch-wise) without changing geometry."""
+    if brightness <= 0 and contrast <= 0 and saturation <= 0:
+        return img
+    out = img
+    device = img.device
+    if brightness > 0:
+        b = float(torch.empty(1, device=device).uniform_(1.0 - brightness, 1.0 + brightness).item())
+        out = out * b
+    if contrast > 0:
+        c = float(torch.empty(1, device=device).uniform_(1.0 - contrast, 1.0 + contrast).item())
+        mean = out.mean(dim=(2, 3), keepdim=True)
+        out = (out - mean) * c + mean
+    if saturation > 0:
+        s = float(torch.empty(1, device=device).uniform_(1.0 - saturation, 1.0 + saturation).item())
+        gray = out.mean(dim=1, keepdim=True)
+        out = (out - gray) * s + gray
+    return out.clamp(0.0, 1.0)
+
+
+def _make_mv_view(
+    img: torch.Tensor,
+    scale: float,
+    hflip_p: float,
+    brightness: float,
+    contrast: float,
+    saturation: float,
+    stride: int,
+) -> tuple[torch.Tensor, dict]:
+    """Build a light multi-view for teacher and return mapping metadata."""
+    bsz, _, h, w = img.shape
+    scale = max(float(scale), 0.0)
+    sf = 1.0
+    if scale > 0:
+        sf = float(torch.empty(1, device=img.device).uniform_(1.0 - scale, 1.0 + scale).item())
+    new_h = max(int(round(h * sf / stride) * stride), stride)
+    new_w = max(int(round(w * sf / stride) * stride), stride)
+    out = img
+    if new_h != h or new_w != w:
+        out = F.interpolate(out, size=(new_h, new_w), mode="bilinear", align_corners=False)
+    do_flip = False
+    if hflip_p > 0 and float(torch.rand(1, device=img.device).item()) < hflip_p:
+        out = torch.flip(out, dims=[3])
+        do_flip = True
+    out = _apply_light_color_jitter(out, brightness, contrast, saturation)
+    meta = {
+        "orig_hw": (h, w),
+        "aug_hw": (new_h, new_w),
+        "scale_x": float(new_w / w),
+        "scale_y": float(new_h / h),
+        "hflip": do_flip,
+        "bsz": int(bsz),
+    }
+    return out, meta
+
+
+def _remap_nms_boxes_to_orig(
+    nms_out: list[torch.Tensor],
+    orig_hw: tuple[int, int],
+    aug_hw: tuple[int, int],
+    scale_x: float,
+    scale_y: float,
+    hflip: bool,
+) -> list[torch.Tensor]:
+    """Remap NMS boxes from augmented view back to original image coordinates."""
+    orig_h, orig_w = orig_hw
+    aug_h, aug_w = aug_hw
+    out: list[torch.Tensor] = []
+    for det in nms_out:
+        if det is None or det.numel() == 0:
+            out.append(det)
+            continue
+        det = det.clone()
+        xyxy = det[:, :4]
+        if hflip:
+            x1 = xyxy[:, 0].clone()
+            x2 = xyxy[:, 2].clone()
+            xyxy[:, 0] = aug_w - x2
+            xyxy[:, 2] = aug_w - x1
+        xyxy[:, [0, 2]] = xyxy[:, [0, 2]] / max(scale_x, 1e-9)
+        xyxy[:, [1, 3]] = xyxy[:, [1, 3]] / max(scale_y, 1e-9)
+        xyxy[:, 0].clamp_(0, orig_w)
+        xyxy[:, 2].clamp_(0, orig_w)
+        xyxy[:, 1].clamp_(0, orig_h)
+        xyxy[:, 3].clamp_(0, orig_h)
+        det[:, :4] = xyxy
+        out.append(det)
+    return out
+
+
+def _max_iou_per_det(det_ref: torch.Tensor, det_aug: torch.Tensor) -> torch.Tensor:
+    """Compute per-det max IoU with same-class boxes."""
+    device = det_ref.device
+    n = det_ref.shape[0]
+    if n == 0:
+        return torch.zeros((0, 1), device=device, dtype=torch.float32)
+    if det_aug is None or det_aug.numel() == 0:
+        return torch.zeros((n, 1), device=device, dtype=torch.float32)
+    cls_ref = det_ref[:, 5].to(dtype=torch.long)
+    cls_aug = det_aug[:, 5].to(dtype=torch.long)
+    ious = torch.zeros((n, 1), device=device, dtype=torch.float32)
+    for c in cls_ref.unique().tolist():
+        ref_idx = (cls_ref == c).nonzero(as_tuple=False).view(-1)
+        aug_idx = (cls_aug == c).nonzero(as_tuple=False).view(-1)
+        if ref_idx.numel() == 0 or aug_idx.numel() == 0:
+            continue
+        iou_mat = box_iou(det_ref[ref_idx, :4], det_aug[aug_idx, :4])
+        ious[ref_idx] = iou_mat.max(1, keepdim=True)[0]
+    return ious
+
+
+def _consistency_iou_from_nms(
+    nms_ref: list[torch.Tensor],
+    nms_aug: list[torch.Tensor] | None,
+    device: torch.device,
+) -> torch.Tensor:
+    """Concatenate per-box IoU consistency for all images in batch."""
+    if not nms_ref:
+        return torch.zeros((0, 1), device=device, dtype=torch.float32)
+    iou_list: list[torch.Tensor] = []
+    if nms_aug is None:
+        for det_ref in nms_ref:
+            if det_ref is None or det_ref.numel() == 0:
+                continue
+            iou_list.append(_max_iou_per_det(det_ref[:, :6], None))
+    else:
+        for det_ref, det_aug in zip(nms_ref, nms_aug):
+            if det_ref is None or det_ref.numel() == 0:
+                continue
+            det_ref = det_ref[:, :6]
+            det_aug = det_aug[:, :6] if (det_aug is not None and det_aug.numel()) else None
+            iou_list.append(_max_iou_per_det(det_ref, det_aug))
+    if not iou_list:
+        return torch.zeros((0, 1), device=device, dtype=torch.float32)
+    return torch.cat(iou_list, 0)
 
 
 def _cal_density_from_nms(nms_out: list[torch.Tensor], nc: int, device: torch.device) -> torch.Tensor:
@@ -470,6 +613,14 @@ class VersatileTeacherTrainer(DetectionTrainer):
         self.args.vt_strong_hue = float(getattr(self.args, "vt_strong_hue", 0.5))
         self.args.vt_strong_blur_kernel = int(getattr(self.args, "vt_strong_blur_kernel", 5))
         self.args.vt_strong_erasing_p = float(getattr(self.args, "vt_strong_erasing_p", 0.5))
+        self.args.vt_mv_enable = bool(getattr(self.args, "vt_mv_enable", True))
+        self.args.vt_mv_scale = float(getattr(self.args, "vt_mv_scale", 0.1))
+        self.args.vt_mv_hflip_p = float(getattr(self.args, "vt_mv_hflip_p", 0.5))
+        self.args.vt_mv_brightness = float(getattr(self.args, "vt_mv_brightness", 0.1))
+        self.args.vt_mv_contrast = float(getattr(self.args, "vt_mv_contrast", 0.1))
+        self.args.vt_mv_saturation = float(getattr(self.args, "vt_mv_saturation", 0.1))
+        self.args.vt_harmony_beta = float(getattr(self.args, "vt_harmony_beta", 0.5))
+        self.args.vt_harmony_iou_min = float(getattr(self.args, "vt_harmony_iou_min", 0.0))
 
         self._ce = nn.CrossEntropyLoss()
         self._bce = nn.BCEWithLogitsLoss()
@@ -607,6 +758,9 @@ class VersatileTeacherTrainer(DetectionTrainer):
         pl_conf_count = int(getattr(self, "_pl_conf_count", 0))
         pl_conf_sum = float(getattr(self, "_pl_conf_sum", 0.0))
         pl_vals["train/pl_mean_conf"] = float(pl_conf_sum / max(pl_conf_count, 1))
+        pl_iou_count = int(getattr(self, "_pl_iou_count", 0))
+        pl_iou_sum = float(getattr(self, "_pl_iou_sum", 0.0))
+        pl_vals["train/pl_mean_iou"] = float(pl_iou_sum / max(pl_iou_count, 1))
         pl_w_count = int(getattr(self, "_pl_w_count", 0))
         pl_w_sum = float(getattr(self, "_pl_w_sum", 0.0))
         pl_vals["train/pl_mean_weight"] = float(pl_w_sum / max(pl_w_count, 1))
@@ -737,6 +891,8 @@ class VersatileTeacherTrainer(DetectionTrainer):
             self._pl_w_nz = 0
             self._pl_conf_sum = 0.0
             self._pl_conf_count = 0
+            self._pl_iou_sum = 0.0
+            self._pl_iou_count = 0
             self._pl_conf_hist = torch.zeros((10,), device="cpu", dtype=torch.long)
             nc = int(getattr(unwrap_model(self.model).model[-1], "nc", 0) or 0)
             self._pl_cls_hist = torch.zeros((nc,), device="cpu", dtype=torch.long)
@@ -850,13 +1006,65 @@ class VersatileTeacherTrainer(DetectionTrainer):
                                     max_det=1000,
                                     nc=nc,
                                 )
+                            nms_out_mv = None
+                            if self.args.vt_mv_enable:
+                                mv_stride = int(strides.max().item()) if isinstance(strides, torch.Tensor) else int(strides)
+                                img_tgt_mv, mv_meta = _make_mv_view(
+                                    img_tgt_weak,
+                                    scale=self.args.vt_mv_scale,
+                                    hflip_p=self.args.vt_mv_hflip_p,
+                                    brightness=self.args.vt_mv_brightness,
+                                    contrast=self.args.vt_mv_contrast,
+                                    saturation=self.args.vt_mv_saturation,
+                                    stride=mv_stride,
+                                )
+                                preds_mv = teacher(img_tgt_mv)
+                                if self.args.vt_caps:
+                                    nms_out_mv = _nms_per_class_conf_thres(
+                                        preds_mv,
+                                        cls_conf_thres=self._cls_conf_thres,
+                                        iou_thres=self.args.vt_iou,
+                                        max_det=1000,
+                                        nc=nc,
+                                    )
+                                else:
+                                    nms_out_mv = non_max_suppression(
+                                        preds_mv,
+                                        conf_thres=self.args.vt_conf,
+                                        iou_thres=self.args.vt_iou,
+                                        max_det=1000,
+                                        nc=nc,
+                                    )
+                                nms_out_mv = _remap_nms_boxes_to_orig(
+                                    nms_out_mv,
+                                    orig_hw=mv_meta["orig_hw"],
+                                    aug_hw=mv_meta["aug_hw"],
+                                    scale_x=mv_meta["scale_x"],
+                                    scale_y=mv_meta["scale_y"],
+                                    hflip=mv_meta["hflip"],
+                                )
                             _, _, h, w = img_tgt_weak.shape
 
                             p_batch_idx, p_cls, p_bboxes, p_conf = _pseudo_labels_from_teacher_nms(
                                 nms_out, img_hw=(h, w), device=batch_tgt["img"].device
                             )
-                            # VT reproduction: hard CAPS uses unweighted pseudo-label loss (weight=1 for kept labels).
-                            w = torch.ones_like(p_conf) if p_conf.numel() else torch.zeros_like(p_conf)
+                            if self.args.vt_mv_enable:
+                                p_iou = _consistency_iou_from_nms(nms_out, nms_out_mv, device=batch_tgt["img"].device)
+                            else:
+                                p_iou = p_conf.clone()
+                            if p_conf.numel() and p_iou.numel() == 0:
+                                p_iou = p_conf.clone()
+                            if p_iou.numel():
+                                p_iou = p_iou.clamp(min=float(self.args.vt_harmony_iou_min), max=1.0)
+                            beta = float(self.args.vt_harmony_beta)
+                            p_conf_clamped = p_conf.clamp(0.0, 1.0)
+                            w = (
+                                (p_conf_clamped**beta) * (p_iou**(1.0 - beta))
+                                if p_conf.numel()
+                                else torch.zeros_like(p_conf)
+                            )
+                            if float(self.args.vt_pl_weight_cap) > 0:
+                                w = w.clamp(max=float(self.args.vt_pl_weight_cap))
                             w_mean = float(w.mean().detach().cpu()) if w.numel() else 0.0
                             # Pseudo-label statistics for analysis
                             bsz = int(img_tgt_weak.shape[0])
@@ -869,6 +1077,10 @@ class VersatileTeacherTrainer(DetectionTrainer):
                                 self._pl_conf_count += int(p_conf.numel())
                                 conf_bins = (p_conf.detach().flatten().cpu().clamp(0.0, 0.99) * 10.0).to(dtype=torch.long)
                                 self._pl_conf_hist += torch.bincount(conf_bins, minlength=10).to(dtype=torch.long)
+                            if p_iou.numel():
+                                self._pl_iou_sum += float(p_iou.detach().sum().cpu())
+                                self._pl_iou_count += int(p_iou.numel())
+                            if w.numel():
                                 self._pl_w_sum += float(w.detach().sum().cpu())
                                 self._pl_w_count += int(w.numel())
                                 self._pl_w_nz += int((w.detach() > 0).sum().cpu())
@@ -880,6 +1092,7 @@ class VersatileTeacherTrainer(DetectionTrainer):
                         pseudo_batch["batch_idx"] = p_batch_idx
                         pseudo_batch["cls"] = p_cls
                         pseudo_batch["bboxes"] = p_bboxes
+                        pseudo_batch["weights"] = w
                         # strong: apply additional strong augmentation only on the student branch
                         pseudo_batch["img"] = self._strong_transform(img_tgt_weak) if self.args.vt_strong_enable else img_tgt_weak
 
