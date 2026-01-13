@@ -132,6 +132,7 @@ vt_auto_pretrained: True # (bool) if model is YAML and pretrained=True, auto-ini
 vt_caps_q: 0.9 # (float) CAPS per-class confidence quantile (precision-first: higher)
 vt_caps_gamma: 2.0 # (float) pseudo-label soft weight sharpness (w^gamma), higher -> more precision-focused
 vt_caps_tau: 0.05 # (float) soft-weight temperature for sigmoid((conf-thr)/tau); smaller -> more precision
+vt_caps_soft: true # (bool) enable soft CAPS weighting (sigmoid-based)
 vt_pl_warmup_epochs: 0 # (int) phase-2 pseudo-label loss warmup epochs (0 disables, VT default)
 vt_pl_weight_cap: 1.0 # (float) cap on pseudo-label batch mean weight after CAPS (0..1)
 vt_da_warmup_epochs: 0 # (int) phase-2 DA loss warmup epochs (0 disables)

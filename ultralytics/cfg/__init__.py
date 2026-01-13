@@ -265,6 +265,7 @@ CFG_BOOL_KEYS = frozenset(
         "use_instance_masks",
         "vt_mv_enable",
         "vt_vis_enable",
+        "vt_caps_soft",
     }
 )
 

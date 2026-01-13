@@ -603,6 +603,7 @@ class VersatileTeacherTrainer(DetectionTrainer):
         self.args.vt_caps_q = float(getattr(self.args, "vt_caps_q", 0.9))
         self.args.vt_caps_gamma = float(getattr(self.args, "vt_caps_gamma", 2.0))
         self.args.vt_caps_tau = float(getattr(self.args, "vt_caps_tau", 0.05))
+        self.args.vt_caps_soft = bool(getattr(self.args, "vt_caps_soft", True))
         self.args.vt_pl_warmup_epochs = int(getattr(self.args, "vt_pl_warmup_epochs", 0))
         self.args.vt_pl_weight_cap = float(getattr(self.args, "vt_pl_weight_cap", 1.0))
         self.args.vt_da_warmup_epochs = int(getattr(self.args, "vt_da_warmup_epochs", 0))
@@ -1151,6 +1152,16 @@ class VersatileTeacherTrainer(DetectionTrainer):
                                 if p_conf.numel()
                                 else torch.zeros_like(p_conf)
                             )
+                            if self.args.vt_caps and self.args.vt_caps_soft and p_conf.numel():
+                                cls_ids = p_cls.detach().view(-1).to(dtype=torch.long)
+                                cls_ids = cls_ids.clamp(0, self._cls_conf_thres.numel() - 1)
+                                thr = self._cls_conf_thres.to(device=p_conf.device, dtype=p_conf.dtype)[cls_ids]
+                                tau = max(float(self.args.vt_caps_tau), 1e-6)
+                                w_caps = torch.sigmoid((p_conf.view(-1) - thr) / tau).view_as(p_conf)
+                                gamma = float(self.args.vt_caps_gamma)
+                                if gamma != 1.0:
+                                    w_caps = w_caps**gamma
+                                w = w * w_caps
                             if float(self.args.vt_pl_weight_cap) > 0:
                                 w = w.clamp(max=float(self.args.vt_pl_weight_cap))
                             w_mean = float(w.mean().detach().cpu()) if w.numel() else 0.0
