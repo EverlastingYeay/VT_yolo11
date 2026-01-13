@@ -133,6 +133,8 @@ vt_caps_q: 0.9 # (float) CAPS per-class confidence quantile (precision-first: hi
 vt_caps_gamma: 2.0 # (float) pseudo-label soft weight sharpness (w^gamma), higher -> more precision-focused
 vt_caps_tau: 0.05 # (float) soft-weight temperature for sigmoid((conf-thr)/tau); smaller -> more precision
 vt_caps_soft: true # (bool) enable soft CAPS weighting (sigmoid-based)
+vt_caps_hard: true # (bool) enable hard CAPS filtering (per-class threshold NMS)
+vt_caps_hard_epochs: -1 # (int) hard CAPS duration in phase-2 epochs; -1 always hard, 0 always soft
 vt_pl_warmup_epochs: 0 # (int) phase-2 pseudo-label loss warmup epochs (0 disables, VT default)
 vt_pl_weight_cap: 1.0 # (float) cap on pseudo-label batch mean weight after CAPS (0..1)
 vt_da_warmup_epochs: 0 # (int) phase-2 DA loss warmup epochs (0 disables)

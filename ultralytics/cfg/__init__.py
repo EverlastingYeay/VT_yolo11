@@ -221,6 +221,7 @@ CFG_INT_KEYS = frozenset(
         "vt_da_warmup_epochs",
         "vt_vis_interval",
         "vt_vis_max_images",
+        "vt_caps_hard_epochs",
     }
 )
 CFG_BOOL_KEYS = frozenset(
@@ -266,6 +267,7 @@ CFG_BOOL_KEYS = frozenset(
         "vt_mv_enable",
         "vt_vis_enable",
         "vt_caps_soft",
+        "vt_caps_hard",
     }
 )
 

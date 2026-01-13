@@ -604,6 +604,8 @@ class VersatileTeacherTrainer(DetectionTrainer):
         self.args.vt_caps_gamma = float(getattr(self.args, "vt_caps_gamma", 2.0))
         self.args.vt_caps_tau = float(getattr(self.args, "vt_caps_tau", 0.05))
         self.args.vt_caps_soft = bool(getattr(self.args, "vt_caps_soft", True))
+        self.args.vt_caps_hard = bool(getattr(self.args, "vt_caps_hard", True))
+        self.args.vt_caps_hard_epochs = int(getattr(self.args, "vt_caps_hard_epochs", -1))
         self.args.vt_pl_warmup_epochs = int(getattr(self.args, "vt_pl_warmup_epochs", 0))
         self.args.vt_pl_weight_cap = float(getattr(self.args, "vt_pl_weight_cap", 1.0))
         self.args.vt_da_warmup_epochs = int(getattr(self.args, "vt_da_warmup_epochs", 0))
@@ -1071,6 +1073,10 @@ class VersatileTeacherTrainer(DetectionTrainer):
                                 max_det=1000,
                                 nc=nc,
                             )
+                            hard_caps = bool(self.args.vt_caps_hard) and (
+                                int(self.args.vt_caps_hard_epochs) < 0
+                                or int(phase2_step) < int(self.args.vt_caps_hard_epochs)
+                            )
                             if self.args.vt_caps:
                                 alpha_conf = 1.0 - cosine_decay.cal_alpha_conf(ni)
                                 conf_delta = _cal_density_from_nms(nms_for_density, nc=nc, device=self.device)
@@ -1078,14 +1084,24 @@ class VersatileTeacherTrainer(DetectionTrainer):
                                 missing = conf_delta < 0.05
                                 conf_delta[missing] = self._cls_conf_thres[missing]
                                 self._cls_conf_thres = self._cls_conf_thres * alpha_conf + conf_delta * (1.0 - alpha_conf)
-                                # 2) Second-stage NMS with per-class confidence thresholds (hard filter).
-                                nms_out = _nms_per_class_conf_thres(
-                                    preds,
-                                    cls_conf_thres=self._cls_conf_thres,
-                                    iou_thres=self.args.vt_iou,
-                                    max_det=1000,
-                                    nc=nc,
-                                )
+                                if hard_caps:
+                                    # 2) Second-stage NMS with per-class confidence thresholds (hard filter).
+                                    nms_out = _nms_per_class_conf_thres(
+                                        preds,
+                                        cls_conf_thres=self._cls_conf_thres,
+                                        iou_thres=self.args.vt_iou,
+                                        max_det=1000,
+                                        nc=nc,
+                                    )
+                                else:
+                                    # Pure soft-CAPS: avoid per-class hard filtering.
+                                    nms_out = non_max_suppression(
+                                        preds,
+                                        conf_thres=self.args.vt_conf,
+                                        iou_thres=self.args.vt_iou,
+                                        max_det=1000,
+                                        nc=nc,
+                                    )
                             else:
                                 # fallback: plain NMS
                                 nms_out = non_max_suppression(
@@ -1108,7 +1124,7 @@ class VersatileTeacherTrainer(DetectionTrainer):
                                     stride=mv_stride,
                                 )
                                 preds_mv = teacher(img_tgt_mv)
-                                if self.args.vt_caps:
+                                if self.args.vt_caps and hard_caps:
                                     nms_out_mv = _nms_per_class_conf_thres(
                                         preds_mv,
                                         cls_conf_thres=self._cls_conf_thres,
