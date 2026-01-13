@@ -194,6 +194,13 @@ CFG_FRACTION_KEYS = frozenset(
         "vt_iou",
         "vt_caps_q",
         "vt_caps_tau",
+        "vt_mv_scale",
+        "vt_mv_hflip_p",
+        "vt_mv_brightness",
+        "vt_mv_contrast",
+        "vt_mv_saturation",
+        "vt_harmony_beta",
+        "vt_harmony_iou_min",
     }
 )
 CFG_INT_KEYS = frozenset(
@@ -212,6 +219,8 @@ CFG_INT_KEYS = frozenset(
         "vt_phase1_epochs",
         "vt_pl_warmup_epochs",
         "vt_da_warmup_epochs",
+        "vt_vis_interval",
+        "vt_vis_max_images",
     }
 )
 CFG_BOOL_KEYS = frozenset(
@@ -254,6 +263,8 @@ CFG_BOOL_KEYS = frozenset(
         "vt_val_per_class",
         "vt_auto_pretrained",
         "use_instance_masks",
+        "vt_mv_enable",
+        "vt_vis_enable",
     }
 )
 

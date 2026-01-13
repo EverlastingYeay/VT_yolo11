@@ -144,6 +144,18 @@ vt_strong_saturation: 0.5 # (float) ColorJitter saturation strength (0 disables)
 vt_strong_hue: 0.1 # (float) ColorJitter hue strength (0 disables)
 vt_strong_blur_kernel: 5 # (int) GaussianBlur kernel size (odd >=3, 0 disables)
 vt_strong_erasing_p: 0.1 # (float) RandomErasing probability (0 disables)
+vt_mv_enable: True # (bool) enable teacher multi-view consistency for pseudo labels
+vt_mv_scale: 0.1 # (float) multi-view scale jitter ratio
+vt_mv_hflip_p: 0.5 # (float) multi-view horizontal flip probability
+vt_mv_brightness: 0.1 # (float) multi-view brightness jitter (0 disables)
+vt_mv_contrast: 0.1 # (float) multi-view contrast jitter (0 disables)
+vt_mv_saturation: 0.1 # (float) multi-view saturation jitter (0 disables)
+vt_harmony_beta: 0.5 # (float) harmony weighting beta for conf vs loc consistency
+vt_harmony_iou_min: 0.0 # (float) minimum consistency IoU clamp
+vt_vis_enable: False # (bool) dump pseudo-label JSON for visualization
+vt_vis_interval: 200 # (int) steps between visualization dumps
+vt_vis_dir: runs/visual # (str) output dir for visualization dumps
+vt_vis_max_images: 8 # (int) max images per dump
 use_instance_masks: false # (bool) enable instance masks for instance-domain tap (VT)
 copy_paste: 0.0 # (float) segmentation copy-paste probability
 copy_paste_mode: flip # (str) copy-paste strategy for segmentation: flip or mixup

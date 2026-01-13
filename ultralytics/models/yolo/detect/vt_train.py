@@ -621,6 +621,10 @@ class VersatileTeacherTrainer(DetectionTrainer):
         self.args.vt_mv_saturation = float(getattr(self.args, "vt_mv_saturation", 0.1))
         self.args.vt_harmony_beta = float(getattr(self.args, "vt_harmony_beta", 0.5))
         self.args.vt_harmony_iou_min = float(getattr(self.args, "vt_harmony_iou_min", 0.0))
+        self.args.vt_vis_enable = bool(getattr(self.args, "vt_vis_enable", False))
+        self.args.vt_vis_interval = int(getattr(self.args, "vt_vis_interval", 200))
+        self.args.vt_vis_dir = str(getattr(self.args, "vt_vis_dir", "runs/visual"))
+        self.args.vt_vis_max_images = int(getattr(self.args, "vt_vis_max_images", 8))
 
         self._ce = nn.CrossEntropyLoss()
         self._bce = nn.BCEWithLogitsLoss()
@@ -786,6 +790,90 @@ class VersatileTeacherTrainer(DetectionTrainer):
         lr_vals = {f"lr/pg{i}": float(x["lr"]) for i, x in enumerate(self.optimizer.param_groups)}
 
         self.save_metrics(metrics={**train_vals, **val_vals, **pl_vals, **lr_vals})
+
+    def _maybe_save_pl_vis_json(
+        self,
+        step: int,
+        img_paths: list[str] | None,
+        bsz: int,
+        img_hw: tuple[int, int],
+        p_batch_idx: torch.Tensor,
+        p_cls: torch.Tensor,
+        p_conf: torch.Tensor,
+        p_iou: torch.Tensor,
+        p_w: torch.Tensor,
+        p_bboxes: torch.Tensor,
+    ) -> None:
+        """Optionally dump pseudo-labels + weights to JSON for visualization."""
+        if not getattr(self.args, "vt_vis_enable", False):
+            return
+        if RANK not in {-1, 0}:
+            return
+        interval = int(getattr(self.args, "vt_vis_interval", 0))
+        if interval > 0 and (int(step) % interval) != 0:
+            return
+        vis_dir = Path(getattr(self.args, "vt_vis_dir", "runs/visual"))
+        vis_dir.mkdir(parents=True, exist_ok=True)
+
+        bsz = int(bsz)
+        max_images = int(getattr(self.args, "vt_vis_max_images", 0)) or bsz
+        max_images = max(0, min(max_images, bsz))
+        if max_images == 0:
+            return
+
+        p_num = int(p_bboxes.shape[0]) if isinstance(p_bboxes, torch.Tensor) else 0
+        if p_num:
+            b_xyxy = xywh2xyxy(p_bboxes.detach().clone())
+            b_xyxy[:, [0, 2]] *= float(img_hw[1])
+            b_xyxy[:, [1, 3]] *= float(img_hw[0])
+            xyxy = b_xyxy.cpu().tolist()
+            bidx = p_batch_idx.detach().cpu().tolist()
+            cls = p_cls.detach().view(-1).cpu().tolist()
+            conf = p_conf.detach().view(-1).cpu().tolist()
+            iou = p_iou.detach().view(-1).cpu().tolist()
+            w = p_w.detach().view(-1).cpu().tolist()
+        else:
+            xyxy, bidx, cls, conf, iou, w = [], [], [], [], [], []
+
+        per_img = [[] for _ in range(max_images)]
+        for k in range(len(bidx)):
+            bi = int(bidx[k])
+            if bi < 0 or bi >= max_images:
+                continue
+            per_img[bi].append(
+                {
+                    "xyxy": [float(v) for v in xyxy[k]],
+                    "cls": int(cls[k]) if cls else 0,
+                    "conf": float(conf[k]) if conf else 0.0,
+                    "iou": float(iou[k]) if iou else 0.0,
+                    "weight": float(w[k]) if w else 0.0,
+                    "name": (
+                        str(self._pl_cls_names[int(cls[k])])
+                        if getattr(self, "_pl_cls_names", None) and cls and int(cls[k]) < len(self._pl_cls_names)
+                        else None
+                    ),
+                }
+            )
+
+        images = []
+        img_paths = img_paths or [f"img_{i}" for i in range(max_images)]
+        for i in range(max_images):
+            images.append(
+                {
+                    "image": str(img_paths[i]),
+                    "height": int(img_hw[0]),
+                    "width": int(img_hw[1]),
+                    "detections": per_img[i],
+                }
+            )
+
+        payload = {
+            "step": int(step),
+            "epoch": int(getattr(self, "epoch", 0)),
+            "images": images,
+        }
+        out_path = vis_dir / f"pl_{int(step):08d}.json"
+        out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
 
     def validate(self):
         """Validate on target domain by default (GT only for evaluation)."""
@@ -1043,10 +1131,10 @@ class VersatileTeacherTrainer(DetectionTrainer):
                                     scale_y=mv_meta["scale_y"],
                                     hflip=mv_meta["hflip"],
                                 )
-                            _, _, h, w = img_tgt_weak.shape
+                            _, _, img_h, img_w = img_tgt_weak.shape
 
                             p_batch_idx, p_cls, p_bboxes, p_conf = _pseudo_labels_from_teacher_nms(
-                                nms_out, img_hw=(h, w), device=batch_tgt["img"].device
+                                nms_out, img_hw=(img_h, img_w), device=batch_tgt["img"].device
                             )
                             if self.args.vt_mv_enable:
                                 p_iou = _consistency_iou_from_nms(nms_out, nms_out_mv, device=batch_tgt["img"].device)
@@ -1087,6 +1175,19 @@ class VersatileTeacherTrainer(DetectionTrainer):
                             if p_cls.numel():
                                 cls_ids = p_cls.detach().flatten().cpu().to(dtype=torch.long)
                                 self._pl_cls_hist += torch.bincount(cls_ids, minlength=self._pl_cls_hist.numel()).to(dtype=torch.long)
+
+                        self._maybe_save_pl_vis_json(
+                            step=ni,
+                            img_paths=batch_tgt.get("im_file", None),
+                            bsz=int(img_tgt_weak.shape[0]),
+                            img_hw=(img_h, img_w),
+                            p_batch_idx=p_batch_idx,
+                            p_cls=p_cls,
+                            p_conf=p_conf,
+                            p_iou=p_iou,
+                            p_w=w,
+                            p_bboxes=p_bboxes,
+                        )
 
                         pseudo_batch = dict(batch_tgt)
                         pseudo_batch["batch_idx"] = p_batch_idx

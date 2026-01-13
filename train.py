@@ -25,6 +25,10 @@ def main():
             "vt_mv_saturation": 0.1,
             "vt_harmony_beta": 0.5,
             "vt_harmony_iou_min": 0.0,
+            "vt_vis_enable": True,
+            "vt_vis_interval": 200,
+            "vt_vis_dir": "runs/visual",
+            "vt_vis_max_images": 8,
             "use_instance_masks": True,
             "vt_source_weak": False,
         }
